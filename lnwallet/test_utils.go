@@ -312,7 +312,7 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 
 	alicePool := NewSigPool(1, aliceSigner)
 	channelAlice, err := NewLightningChannel(
-		aliceSigner, pCache, aliceChannelState, alicePool,
+		aliceSigner, pCache, aliceChannelState, alicePool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -321,7 +321,7 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 
 	bobPool := NewSigPool(1, bobSigner)
 	channelBob, err := NewLightningChannel(
-		bobSigner, pCache, bobChannelState, bobPool,
+		bobSigner, pCache, bobChannelState, bobPool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, err

@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bytes"
+	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
@@ -104,6 +106,16 @@ type chainWatcherConfig struct {
 	// isOurAddr is a function that returns true if the passed address is
 	// known to us.
 	isOurAddr func(btcutil.Address) bool
+
+	// PublishTx reliably broadcasts a transaction to the network. Once
+	// this function exits without an error, then they transaction MUST
+	// continually be rebroadcast if needed.
+	publishTx func(*wire.MsgTx) error
+
+	// db provides access to the channel's justiceTxs provided by its participant(s),
+	// allowing the chain watcher to broadcast justice transaction immediately after detecting
+	// breach transaction published by counterparty.
+	db *channeldb.DB
 }
 
 // chainWatcher is a system that's assigned to every active channel. The duty
@@ -134,6 +146,12 @@ type chainWatcher struct {
 	// clientSubscriptions is a map that keeps track of all the active
 	// client subscriptions for events related to this channel.
 	clientSubscriptions map[uint64]*ChainEventSubscription
+
+	// encryptedData is a map where key corresponds to channel's height, and
+	// value corresponds to encoded revocation data on this height for
+	// chainWatcher's channel. The data is encoded using breach transaction's
+	// hash, so watchtower can decode it no sooner than it appears on-chain.
+	encryptedData map[uint64][]byte
 }
 
 // newChainWatcher returns a new instance of a chainWatcher for a channel given
@@ -163,7 +181,19 @@ func newChainWatcher(cfg chainWatcherConfig) (*chainWatcher, error) {
 		stateHintObfuscator: stateHint,
 		quit:                make(chan struct{}),
 		clientSubscriptions: make(map[uint64]*ChainEventSubscription),
+		encryptedData:       make(map[uint64][]byte),
 	}, nil
+}
+
+func (c *chainWatcher) AppendRevocationData(height uint64,
+	encryptedData []byte, clientPubKey *btcec.PublicKey) error {
+
+	c.Lock()
+	c.encryptedData[height] = encryptedData
+	c.Unlock()
+
+	return c.cfg.db.SaveEncryptedRevocation(c.cfg.chanState.FundingOutpoint,
+		height, c.cfg.chanState.ChainHash, encryptedData, clientPubKey)
 }
 
 // Start starts all goroutines that the chainWatcher needs to perform its
@@ -265,6 +295,306 @@ func (c *chainWatcher) SubscribeChannelEvents() *ChainEventSubscription {
 	return sub
 }
 
+func createSingleJusticeTx(localPaymentBasePoint, remoteHtlcPubkey,
+	localHtlcPubkey, revocationPubKey, delayPubKey *btcec.PublicKey,
+	remoteDelay uint32, revData *lnwallet.RevocationData,
+	breachTx *wire.MsgTx) (*wire.MsgTx, error) {
+
+	commitPoint := revData.CommitPoint
+
+	txn := wire.NewMsgTx(2)
+
+	// We begin by adding the output to which our funds will be deposited.
+	// First, calculate the total amount.
+	var breachAmount int64 = 0
+	for _, txOut := range breachTx.TxOut {
+		breachAmount += txOut.Value
+	}
+	txn.AddTxOut(&wire.TxOut{
+		PkScript: revData.PkScript,
+		Value:    breachAmount - revData.Fee,
+	})
+	// Next, we add all of the spendable outputs as inputs to the
+	// transaction.
+	txHash := breachTx.TxHash()
+	for _, txInInfo := range revData.TxInInfo {
+		var err error
+		prevIndex := txInInfo.PreviousOutpointIndex
+		newTxIn := wire.TxIn{
+			PreviousOutPoint: *wire.NewOutPoint(
+				&txHash,
+				prevIndex,
+			),
+		}
+
+		// verifyWitnessScript returns nil if hashed witnessScript of
+		// our new transaction input matches pkScript of corresponding
+		// breached output. Since it is known which output current
+		// input revokes, we only need to pass the witnessScript.
+		// TODO(ys): redundant? Can't publish anyway with invalid witness
+		verifyWitnessScript := func(witnessScript []byte) error {
+			expectedScript, err := lnwallet.WitnessScriptHash(witnessScript)
+			if err != nil {
+				return err
+			}
+			// Breached output's script.
+			previousScript := breachTx.TxOut[prevIndex].PkScript
+			if bytes.Compare(expectedScript, previousScript) != 0 {
+				return fmt.Errorf("witness script's hash does not " +
+					"match output's pkScript")
+			}
+			return nil
+		}
+
+		// Witness stack differs depending on witness type.
+		// For each input, client must send correct witness type, as
+		// well as correct signature, on which justice transaction
+		// will be based on.
+		witnessType := txInInfo.WitnessType
+		switch witnessType {
+		case lnwallet.HtlcOfferedRevoke:
+			newTxIn.Witness = wire.TxWitness(make([][]byte, 3))
+			newTxIn.Witness[0] = txInInfo.Sig
+			newTxIn.Witness[1] = revocationPubKey.SerializeCompressed()
+			newTxIn.Witness[2], err = lnwallet.ReceiverHTLCScript(
+				txInInfo.RefundTimeout, localHtlcPubkey,
+				remoteHtlcPubkey, revocationPubKey,
+				txInInfo.RHash[:],
+			)
+			if err != nil {
+				return nil, err
+			}
+			if err := verifyWitnessScript(newTxIn.Witness[2]); err != nil {
+				return nil, err
+			}
+		case lnwallet.HtlcAcceptedRevoke:
+			newTxIn.Witness = wire.TxWitness(make([][]byte, 3))
+			newTxIn.Witness[0] = txInInfo.Sig
+			newTxIn.Witness[1] = revocationPubKey.SerializeCompressed()
+			newTxIn.Witness[2], err = lnwallet.SenderHTLCScript(
+				remoteHtlcPubkey, localHtlcPubkey,
+				revocationPubKey, txInInfo.RHash[:],
+			)
+			if err != nil {
+				return nil, err
+			}
+			if err := verifyWitnessScript(newTxIn.Witness[2]); err != nil {
+				return nil, err
+			}
+		case lnwallet.CommitmentRevoke:
+			newTxIn.Witness = wire.TxWitness(make([][]byte, 3))
+			newTxIn.Witness[0] = txInInfo.Sig
+			newTxIn.Witness[1] = []byte{1}
+			newTxIn.Witness[2], err = lnwallet.CommitScriptToSelf(
+				remoteDelay, delayPubKey, revocationPubKey,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if err := verifyWitnessScript(newTxIn.Witness[2]); err != nil {
+				return nil, err
+			}
+		case lnwallet.CommitmentNoDelay:
+			newTxIn.Witness = wire.TxWitness(make([][]byte, 2))
+			newTxIn.Witness[0] = txInInfo.Sig
+			newTxIn.Witness[1] = lnwallet.TweakPubKeyWithTweak(
+				localPaymentBasePoint,
+				lnwallet.SingleTweakBytes(commitPoint, localPaymentBasePoint),
+			).SerializeCompressed()
+		default:
+			return nil, fmt.Errorf("invalid witnessType: %v", witnessType)
+		}
+		txn.TxIn = append(txn.TxIn, &newTxIn)
+	}
+	btx := btcutil.NewTx(txn)
+	if err := blockchain.CheckTransactionSanity(btx); err != nil {
+		return nil, err
+	}
+
+	return txn, nil
+}
+
+// punishSecondLevelTxOnSpend waits for confirmed second level transaction
+// in spend channel and then creates and publishes corresponding punishing
+// transaction.
+//
+// NOTE: This MUST be run as a goroutine.
+func (c *chainWatcher) punishSecondLevelTxOnSpend(pkScript []byte, fee int64,
+	spend <-chan *chainntnfs.SpendDetail, secondLevelSig []byte,
+	secondLevelScript []byte) {
+
+	select {
+	case commitSpend, ok := <-spend:
+		if !ok {
+			return
+		}
+
+		spendTx := commitSpend.SpendingTx
+		txn := wire.NewMsgTx(2)
+		amount := spendTx.TxOut[0].Value
+
+		// We begin by adding the output to which our funds will be deposited.
+		txn.AddTxOut(&wire.TxOut{
+			PkScript: pkScript,
+			Value:    amount - fee,
+		})
+
+		txHash := spendTx.TxHash()
+		txn.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: *wire.NewOutPoint(
+				&txHash,
+				0,
+			),
+		})
+
+		// Before signing the transaction, check to ensure that it meets some
+		// basic validity requirements.
+		btx := btcutil.NewTx(txn)
+		if err := blockchain.CheckTransactionSanity(btx); err != nil {
+			log.Errorf("%v", err)
+			return
+		}
+
+		txn.TxIn[0].Witness = wire.TxWitness(make([][]byte, 3))
+		txn.TxIn[0].Witness[0] = secondLevelSig
+		txn.TxIn[0].Witness[1] = []byte{1}
+		txn.TxIn[0].Witness[2] = secondLevelScript
+
+		err := c.cfg.publishTx(txn)
+		if err != nil {
+			log.Errorf("Could not publish transaction", txn)
+		}
+
+	case <-c.quit:
+		return
+	}
+}
+
+// dispatchContractBreachWtServer composes and publishes revocation transaction
+// that moves funds from breached outputs to address controlled by cheated
+// party.
+func (c *chainWatcher) dispatchContractBreachWtServer(
+	revData *lnwallet.RevocationData, breachTx *wire.MsgTx,
+	spendingTx *wire.MsgTx, spendingHeight uint32) error {
+
+	commitPoint := revData.CommitPoint
+
+	revocationBasePoint := c.cfg.chanState.LocalChanCfg.RevocationBasePoint.PubKey
+	localPaymentBasePoint := c.cfg.chanState.LocalChanCfg.PaymentBasePoint.PubKey
+	localHtlcBasePoint := c.cfg.chanState.LocalChanCfg.HtlcBasePoint.PubKey
+
+	delayBasePoint := c.cfg.chanState.RemoteChanCfg.DelayBasePoint.PubKey
+	remoteHtlcBasePoint := c.cfg.chanState.RemoteChanCfg.HtlcBasePoint.PubKey
+	remoteDelay := uint32(c.cfg.chanState.RemoteChanCfg.CsvDelay)
+
+	remoteHtlcPubkey := lnwallet.TweakPubKey(remoteHtlcBasePoint, commitPoint)
+	localHtlcPubkey := lnwallet.TweakPubKey(localHtlcBasePoint, commitPoint)
+	revocationPubKey := lnwallet.DeriveRevocationPubkey(revocationBasePoint, commitPoint)
+	delayPubKey := lnwallet.TweakPubKey(delayBasePoint, commitPoint)
+
+	justiceTx, err := createSingleJusticeTx(localPaymentBasePoint,
+		remoteHtlcPubkey, localHtlcPubkey, revocationPubKey,
+		delayPubKey, remoteDelay, revData, breachTx)
+
+	// If we got single justiceTx without any errors we then try to publish it.
+	if err == nil {
+		err = c.cfg.publishTx(justiceTx)
+		// If we can publish single justiceTx without error, we exit this
+		// method as our objective is complete.
+		if err == nil {
+			return nil
+		}
+	} else {
+		return fmt.Errorf("could not generate justice tx "+
+			"for breach transaction %v: %v", breachTx.TxHash(), err)
+	}
+
+	// If at any point we had a problem publishing a single justiceTx, we
+	// then try to create n (n being number of outputs in justiceTx) separate
+	// justice transaction, each of which spend one of the breached outputs.
+	for i, txIn := range justiceTx.TxIn {
+
+		txInInfo := revData.TxInInfo[i]
+		// Since this transaction has only 1 input, the total amount
+		// equals to value of i-th output of spending transaction.
+		prevIndex := txInInfo.PreviousOutpointIndex
+		amount := spendingTx.TxOut[prevIndex].Value
+
+		// Fee was explicitly sent by client.
+		txFee := txInInfo.IndividualSigsAndFees.RegularFee
+
+		sweepAmt := amount - txFee
+
+		// With the fee calculated, we can now create the transaction using the
+		// information gathered above and the provided retribution information.
+		txn := wire.NewMsgTx(2)
+
+		// We begin by adding the output to which our funds will be deposited.
+		txn.AddTxOut(&wire.TxOut{
+			PkScript: justiceTx.TxOut[0].PkScript,
+			Value:    sweepAmt,
+		})
+
+		// Next, we add spendable output as input to the transaction.
+		txn.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: txIn.PreviousOutPoint,
+		})
+
+		// Apply witness.
+		txn.TxIn[0].Witness = justiceTx.TxIn[i].Witness
+		txn.TxIn[0].Witness[0] = txInInfo.IndividualSigsAndFees.RegularSig
+
+		// Check to ensure that tx meets some basic validity requirements.
+		btx := btcutil.NewTx(txn)
+		if err := blockchain.CheckTransactionSanity(btx); err != nil {
+			log.Errorf("%v", err)
+			continue
+		}
+
+		// If we got single justiceTx without any errors we then try to publish it.
+		err = c.cfg.publishTx(txn)
+
+		if err != nil {
+			if err == lnwallet.ErrDoubleSpend {
+				// If we cannot publish this 1-to-1 transaction because of
+				// double spend it could mean that channel's counterparty has
+				// sent HTLC to the second level. If this is the case, we will
+				// create and broadcast 1-to-1 revocation transaction that
+				// punishes it.
+				spendNtfn, err := c.cfg.notifier.RegisterSpendNtfn(
+					&txIn.PreviousOutPoint, []byte{}, spendingHeight,
+				)
+
+				// If we cannot register spend notifier, we will not be able
+				// to revoke second level transaction.
+				if err != nil {
+					log.Errorf("RegisterSpendNtfn: %v", err)
+					continue
+				}
+
+				pkScript := justiceTx.TxOut[0].PkScript
+				fee := txInInfo.IndividualSigsAndFees.SecondLevelFee
+				secondLevelSig := txInInfo.IndividualSigsAndFees.SecondLevelSig
+				secondLevelScript, err := lnwallet.SecondLevelHtlcScript(
+					revocationPubKey, delayPubKey, remoteDelay,
+				)
+				if err != nil {
+					log.Warnf("%+v", err)
+					continue
+				}
+				go c.punishSecondLevelTxOnSpend(
+					pkScript, fee, spendNtfn.Spend,
+					secondLevelSig, secondLevelScript,
+				)
+			} else {
+				log.Errorf("Unexpected error: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // closeObserver is a dedicated goroutine that will watch for any closes of the
 // channel that it's watching on chain. In the event of an on-chain event, the
 // close observer will assembled the proper materials required to claim the
@@ -294,6 +624,39 @@ func (c *chainWatcher) closeObserver(spendNtfn *chainntnfs.SpendEvent) {
 		// Otherwise, the remote party might have broadcast a
 		// prior revoked state...!!!
 		commitTxBroadcast := commitSpend.SpendingTx
+
+		// Decode the state hint encoded within the commitment
+		// transaction to determine if this is a revoked state
+		// or not.
+		obfuscator := c.stateHintObfuscator
+		broadcastStateNum := lnwallet.GetStateNumHint(
+			commitTxBroadcast, obfuscator,
+		)
+
+		// TODO(ys): maybe add a better this-is-WT check
+		c.Lock()
+		ciphertext, ok := c.encryptedData[broadcastStateNum]
+		c.Unlock()
+		if ok {
+			tx := commitSpend.SpendingTx
+			txHash := tx.TxHash()
+			revData := &lnwallet.RevocationData{}
+			err := revData.Decrypt(txHash[:], ciphertext, 0)
+			if err != nil {
+				log.Errorf("%v", err)
+				return
+			}
+			err = c.dispatchContractBreachWtServer(
+				revData, tx, commitTxBroadcast, uint32(commitSpend.SpendingHeight),
+			)
+			if err != nil {
+				log.Error("%v", err)
+			} else {
+				log.Infof("Successfully Published justice for ChannelPoint(%v)",
+					c.cfg.chanState.FundingOutpoint)
+			}
+			return
+		}
 
 		localCommit, remoteCommit, err := c.cfg.chanState.LatestCommitments()
 		if err != nil {
@@ -348,13 +711,6 @@ func (c *chainWatcher) closeObserver(spendNtfn *chainntnfs.SpendEvent) {
 		log.Warnf("Unprompted commitment broadcast for "+
 			"ChannelPoint(%v) ", c.cfg.chanState.FundingOutpoint)
 
-		// Decode the state hint encoded within the commitment
-		// transaction to determine if this is a revoked state
-		// or not.
-		obfuscator := c.stateHintObfuscator
-		broadcastStateNum := lnwallet.GetStateNumHint(
-			commitTxBroadcast, obfuscator,
-		)
 		remoteStateNum := remoteCommit.CommitHeight
 
 		remoteChainTip, err := c.cfg.chanState.RemoteCommitChainTip()
@@ -710,7 +1066,7 @@ func (c *chainWatcher) dispatchRemoteForceClose(
 
 // dispatchContractBreach processes a detected contract breached by the remote
 // party. This method is to be called once we detect that the remote party has
-// broadcast a prior revoked commitment state. This method well prepare all the
+// broadcast a prior revoked commitment state. This method will prepare all the
 // materials required to bring the cheater to justice, then notify all
 // registered subscribers of this event.
 func (c *chainWatcher) dispatchContractBreach(spendEvent *chainntnfs.SpendDetail,
@@ -730,7 +1086,7 @@ func (c *chainWatcher) dispatchContractBreach(spendEvent *chainntnfs.SpendDetail
 		spendHeight       = uint32(spendEvent.SpendingHeight)
 	)
 
-	// Create a new reach retribution struct which contains all the data
+	// Create a new breach retribution struct which contains all the data
 	// needed to swiftly bring the cheating peer to justice.
 	//
 	// TODO(roasbeef): move to same package

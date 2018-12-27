@@ -39,6 +39,7 @@ import (
 	flags "github.com/jessevdk/go-flags"
 
 	"github.com/lightningnetwork/lnd/autopilot"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -46,9 +47,11 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/walletunlocker"
+	"github.com/lightningnetwork/lnd/wtower"
 )
 
 const (
@@ -303,10 +306,16 @@ func lndMain() error {
 			"is proxying over Tor as well", cfg.Tor.StreamIsolation)
 	}
 
+	wtServer := wtower.NewServer(&wtower.ServerConfig{
+		PublishTx: activeChainControl.wallet.PublishTransaction,
+		Db:        chanDB,
+		ChainHash: *activeNetParams.GenesisHash,
+	}, cfg.WtListeners)
+
 	// Set up the core server which will listen for incoming peer
 	// connections.
 	server, err := newServer(
-		cfg.Listeners, chanDB, activeChainControl, idPrivKey,
+		cfg.Listeners, chanDB, activeChainControl, idPrivKey, wtServer,
 	)
 	if err != nil {
 		srvrLog.Errorf("unable to create server: %v\n", err)
@@ -322,6 +331,35 @@ func lndMain() error {
 		ltndLog.Errorf("unable to create autopilot manager: %v", err)
 		return err
 	}
+	wtServer.WatchNewChannel = func(newChannel *channeldb.OpenChannel,
+		clientPubKey *btcec.PublicKey) ([]uint64, error) {
+
+		states, err := server.chainArb.NewWtChainWatcher(newChannel, clientPubKey)
+		if err != nil {
+			return states, err
+		}
+		return states, chanDB.SaveWtChannel(newChannel, clientPubKey)
+	}
+	wtServer.SaveEncryptedRevocation = server.chainArb.SaveEncryptedRevocation
+	wtServer.LightningChannelFromOutPoint = func(outPoint wire.OutPoint) (
+		*lnwallet.LightningChannel, error) {
+
+		channelID := lnwire.NewChanIDFromOutPoint(&outPoint)
+		channel, err := server.fundingMgr.cfg.FindChannel(channelID)
+		if err != nil {
+			return nil, err
+		}
+		lChannel, err := lnwallet.NewLightningChannel(
+			server.cc.signer, server.witnessBeacon, channel, nil,
+			server.wtServer,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to get lightning channel for %v.", 
+				channel)
+		} 
+		return lChannel, nil
+	}
+
 	if err := atplManager.Start(); err != nil {
 		ltndLog.Errorf("unable to start autopilot manager: %v", err)
 		return err

@@ -26,6 +26,13 @@ through the network.
 * Updating advertised fee schedules.
 * Automatic channel management ([`autopilot`](https://github.com/lightningnetwork/lnd/tree/master/autopilot)).
 
+This implementation is a fork that supports watchtower with the help of the following commands and arguments:
+* Specify interface/port to listen for watchtower peer connections after `--wtlisten` (ex. lnd [...] --wtlisten=0.0.0.0:4127).
+* Connect to watchtower via addwatchtower command with \<pubkey\>@host  (ex. lncli [...] `addwatchtower` 03dabbe004ae828badd773f17ddaba7a84f8bb36e2b4029485bfa049fe0c99f09c@localhost:4127).
+* If needed, clients can also send previous revocation data to watchtower on specified height interval using `sendrevdatatowt`. 
+* `listwatchtowers` returns information regarding watchtowers this node established connections with.
+* Use `disconnectwatchtower` to disconnect from watchtower defined by pubkey (ex. lncli [...] disconnectwatchtower --node_key=03dabbe004ae828badd773f17ddaba7a84f8bb36e2b4029485bfa049fe0c99f09c).
+
 ## Lightning Network Specification Compliance
 `lnd` _fully_ conforms to the [Lightning Network specification
 (BOLTs)](https://github.com/lightningnetwork/lightning-rfc). BOLT stands for:

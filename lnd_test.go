@@ -2291,7 +2291,7 @@ func testChannelForceClosure(net *lntest.NetworkHarness, t *harnessTest) {
 		}
 	}
 
-	// Once the HTLC has cleared, all the nodes n our mini network should
+	// Once the HTLC has cleared, all the nodes in our mini network should
 	// show that the HTLC has been locked in.
 	nodes := []*lntest.HarnessNode{net.Alice, carol}
 	var predErr error

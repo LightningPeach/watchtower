@@ -41,6 +41,7 @@ import (
 	"github.com/lightningnetwork/lnd/sweep"
 	"github.com/lightningnetwork/lnd/ticker"
 	"github.com/lightningnetwork/lnd/tor"
+	"github.com/lightningnetwork/lnd/wtower"
 )
 
 const (
@@ -178,6 +179,11 @@ type server struct {
 	// sent ChannelUpdate from announceChanStatus.
 	sentDisabled    map[wire.OutPoint]bool
 	sentDisabledMtx sync.Mutex
+	breachInfoReq   chan lnwallet.BreachInfoReq
+
+	justiceTx         chan *wire.MsgTx
+	breachInfoReqChan chan lnwallet.BreachInfoReq
+	wtServer          *wtower.WTServer
 
 	quit chan struct{}
 
@@ -232,7 +238,7 @@ func noiseDial(idPriv *btcec.PrivateKey) func(net.Addr) (net.Conn, error) {
 // newServer creates a new instance of the server which is to listen using the
 // passed listener address.
 func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
-	privKey *btcec.PrivateKey) (*server, error) {
+	privKey *btcec.PrivateKey, wtServer *wtower.WTServer) (*server, error) {
 
 	var err error
 
@@ -292,7 +298,9 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 
 		globalFeatures: lnwire.NewFeatureVector(globalFeatures,
 			lnwire.GlobalFeatures),
-		quit: make(chan struct{}),
+
+		wtServer: wtServer,
+		quit:     make(chan struct{}),
 	}
 
 	s.witnessBeacon = &preimageBeacon{
@@ -729,6 +737,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 			return s.announceChanStatus(op, true)
 		},
 		Sweeper: s.sweeper,
+		WTServer: wtServer,
 	}, chanDB)
 
 	s.breachArbiter = newBreachArbiter(&BreachConfig{
@@ -743,6 +752,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		ContractBreaches:   contractBreaches,
 		Signer:             cc.wallet.Cfg.Signer,
 		Store:              newRetributionStore(chanDB),
+		WTServer:           wtServer,
 	})
 
 	// Select the configuration and furnding parameters for Bitcoin or
@@ -937,7 +947,40 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 	if err != nil {
 		return nil, err
 	}
+
+	wtListeners := make([]net.Listener, len(s.wtServer.Listeners))
+	for i, listenAddr := range s.wtServer.Listeners {
+		// Note: though brontide.NewListener uses ResolveTCPAddr, it
+		// doesn't need to call the general lndResolveTCP function
+		// since we are resolving a local address.
+		wtListeners[i], err = brontide.NewListener(
+			privKey, listenAddr.String(),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Since we don't want watchtower server to know our node's identity,
+	// we will use private key's hash to identify ourself.
+	pribBytes := s.identityPriv.Serialize()
+	privHash := chainhash.HashB(pribBytes)
+	hashedPriv, _ := btcec.PrivKeyFromBytes(btcec.S256(), privHash)
+	wtCmgr, err := connmgr.New(&connmgr.Config{
+		Listeners:      wtListeners,
+		OnAccept:       s.wtServer.InboundPeerConnected,
+		RetryDuration:  time.Second * 5,
+		TargetOutbound: 100,
+		Dial:           noiseDial(hashedPriv),
+		OnConnection:   s.wtServer.OutboundPeerConnected,
+	})
+	if err != nil {
+		return nil, err
+	}
 	s.connMgr = cmgr
+	wtServer.ConnMgr = wtCmgr
+	wtServer.ParseAddr = parseAddr
+	wtServer.Net = activeNetParams.Net
 
 	return s, nil
 }
@@ -1007,6 +1050,8 @@ func (s *server) Start() error {
 		return err
 	}
 	s.connMgr.Start()
+
+	s.wtServer.Start()
 
 	if err := s.invoices.Start(); err != nil {
 		return err
@@ -1079,6 +1124,7 @@ func (s *server) Stop() error {
 	s.cc.wallet.Shutdown()
 	s.cc.chainView.Stop()
 	s.connMgr.Stop()
+	s.wtServer.Stop()
 	s.cc.feeEstimator.Stop()
 	s.invoices.Stop()
 	s.fundingMgr.Stop()

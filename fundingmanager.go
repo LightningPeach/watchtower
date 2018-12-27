@@ -24,6 +24,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
+	"github.com/lightningnetwork/lnd/wtower"
 	"golang.org/x/crypto/salsa20"
 	"google.golang.org/grpc"
 )
@@ -332,6 +333,8 @@ type fundingConfig struct {
 	// flood us with very small channels that would never really be usable
 	// due to fees.
 	MinChanSize btcutil.Amount
+
+	WTServer *wtower.WTServer
 }
 
 // fundingManager acts as an orchestrator/bridge between the wallet's
@@ -1613,7 +1616,7 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 
 	// Now that we have a finalized reservation for this funding flow,
 	// we'll send the to be active channel to the ChainArbitrator so it can
-	// watch for any on-chin actions before the channel has fully
+	// watch for any on-chain actions before the channel has fully
 	// confirmed.
 	if err := f.cfg.WatchNewChannel(completeChan, peerKey); err != nil {
 		fndgLog.Errorf("Unable to send new ChannelPoint(%v) for "+
@@ -1681,7 +1684,7 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 		// Go on adding the channel to the channel graph, and crafting
 		// channel announcements.
 		lnChannel, err := lnwallet.NewLightningChannel(
-			nil, nil, completeChan, nil,
+			nil, nil, completeChan, nil, f.cfg.WTServer,
 		)
 		if err != nil {
 			fndgLog.Errorf("failed creating lnChannel: %v", err)
@@ -1970,7 +1973,7 @@ func (f *fundingManager) handleFundingConfirmation(peer lnpeer.Peer,
 
 	// We create the state-machine object which wraps the database state.
 	lnChannel, err := lnwallet.NewLightningChannel(
-		nil, nil, completeChan, nil,
+		nil, nil, completeChan, nil, f.cfg.WTServer,
 	)
 	if err != nil {
 		return err

@@ -3417,3 +3417,232 @@ func forwardingHistory(ctx *cli.Context) error {
 	printRespJSON(resp)
 	return nil
 }
+
+var sendRevDataToWtCommand = cli.Command{
+	Name:     "sendrevdatatowt",
+	Category: "Watchtower",
+	Usage: "Send previous revocation data to watchtower on specified " +
+		"height interval.",
+	Description: `
+	Sends revocation data for channel defined by channel point which is encoded
+	as funding_txid:output_index. Sent data is used for creating justice
+	transaction on watchtower and consists of revocation data for every state
+	number on the interval from start_height to end_height inclusive.
+	`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "funding_txid",
+			Usage: "the txid of the channel's funding transaction",
+		},
+		cli.IntFlag{
+			Name: "output_index",
+			Usage: "the output index for the funding output of the funding " +
+				"transaction",
+		},
+		cli.Uint64Flag{
+			Name: "start_height",
+			Usage: "(optional) the starting height for which revocation data " +
+				"should be sent.",
+		},
+		cli.Uint64Flag{
+			Name: "end_height",
+			Usage: "(optional) the ending height for which revocation data " +
+				"should be sent.",
+			Value: math.MaxUint64,
+		},
+	},
+	Action: actionDecorator(sendRevDataToWt),
+}
+
+func sendRevDataToWt(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	var (
+		chanPoint   = &lnrpc.ChannelPoint{}
+		endHeight   = ctx.Uint64("end_height")
+		startHeight uint64
+		err         error
+	)
+	args := ctx.Args()
+
+	switch {
+	case ctx.IsSet("funding_txid"):
+		chanPoint.FundingTxid = &lnrpc.ChannelPoint_FundingTxidStr{
+			FundingTxidStr: ctx.String("funding_txid"),
+		}
+	case args.Present():
+		chanPoint.FundingTxid = &lnrpc.ChannelPoint_FundingTxidStr{
+			FundingTxidStr: args.First(),
+		}
+		args = args.Tail()
+	default:
+		return fmt.Errorf("funding txid argument missing")
+	}
+
+	switch {
+	case ctx.IsSet("output_index"):
+		chanPoint.OutputIndex = uint32(ctx.Int("output_index"))
+	case args.Present():
+		index, err := strconv.ParseUint(args.First(), 10, 32)
+		if err != nil {
+			return fmt.Errorf("unable to decode output index: %v", err)
+		}
+		chanPoint.OutputIndex = uint32(index)
+		args = args.Tail()
+	default:
+		chanPoint.OutputIndex = 0
+	}
+
+	switch {
+	case ctx.IsSet("start_height"):
+		startHeight = ctx.Uint64("start_height")
+	case args.Present():
+		startHeight, err = strconv.ParseUint(args.First(), 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to decode start_height %v", err)
+		}
+		args = args.Tail()
+	}
+
+	switch {
+	case ctx.IsSet("end_height"):
+		endHeight = ctx.Uint64("end_height")
+	case args.Present():
+		endHeight, err = strconv.ParseUint(args.First(), 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to decode end_height: %v", err)
+		}
+		args = args.Tail()
+	}
+
+	req := &lnrpc.SendRevDataToWtRequest{
+		ChannelPoint: chanPoint,
+		StartHeight:  startHeight,
+		EndHeight:    endHeight,
+	}
+	resp, err := client.SendRevDataToWt(ctxb, req)
+	if err != nil {
+		return err
+	}
+	printRespJSON(resp)
+	return nil
+}
+
+var addWatchtowerCommand = cli.Command{
+	Name:      "addwatchtower",
+	Category:  "Watchtower",
+	Usage:     "Connect to a remote lnd watchtower.",
+	ArgsUsage: "<pubkey>@host",
+	Action:    actionDecorator(addWatchtower),
+}
+
+func addWatchtower(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	targetAddress := ctx.Args().First()
+	splitAddr := strings.Split(targetAddress, "@")
+	if len(splitAddr) != 2 {
+		return fmt.Errorf("target address expected in format: " +
+			"pubkey@host:port")
+	}
+
+	addr := &lnrpc.LightningAddress{
+		Pubkey: splitAddr[0],
+		Host:   splitAddr[1],
+	}
+	req := &lnrpc.AddWatchtowerRequest{
+		Addr: addr,
+	}
+
+	lnid, err := client.AddWatchtower(ctxb, req)
+	if err != nil {
+		return err
+	}
+
+	printRespJSON(lnid)
+	return nil
+}
+
+var listWatchtowersCommand = cli.Command{
+	Name:     "listwatchtowers",
+	Category: "Watchtower",
+	Usage:    "List all watchtowers that serve this lnd.",
+	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name:  "active_only",
+			Usage: "only list channels which are currently active",
+		},
+		cli.BoolFlag{
+			Name:  "inactive_only",
+			Usage: "only list channels which are currently inactive",
+		},
+	},
+	Action: actionDecorator(listWatchtowers),
+}
+
+func listWatchtowers(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	req := &lnrpc.ListWatchtowersRequest{
+		ActiveOnly:   ctx.Bool("active_only"),
+		InactiveOnly: ctx.Bool("inactive_only"),
+	}
+
+	resp, err := client.ListWatchtowers(ctxb, req)
+	if err != nil {
+		return err
+	}
+
+	printRespJSON(resp)
+
+	return nil
+}
+
+var disconnectWatchtowerCommand = cli.Command{
+	Name:      "disconnectwatchtower",
+	Category:  "Watchtower",
+	Usage:     "Disconnect a remote watchtower identified by public key.",
+	ArgsUsage: "<pubkey>",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name: "node_key",
+			Usage: "The hex-encoded compressed public key of the watchtower " +
+				"to disconnect from",
+		},
+	},
+	Action: actionDecorator(disconnectWatchtower),
+}
+
+func disconnectWatchtower(ctx *cli.Context) error {
+	ctxb := context.Background()
+	client, cleanUp := getClient(ctx)
+	defer cleanUp()
+
+	var pubKey string
+	switch {
+	case ctx.IsSet("node_key"):
+		pubKey = ctx.String("node_key")
+	case ctx.Args().Present():
+		pubKey = ctx.Args().First()
+	default:
+		return fmt.Errorf("must specify target public key")
+	}
+
+	req := &lnrpc.DisconnectWatchtowerRequest{
+		PubKey: pubKey,
+	}
+
+	lnid, err := client.DisconnectWatchtower(ctxb, req)
+	if err != nil {
+		return err
+	}
+
+	printRespJSON(lnid)
+	return nil
+}

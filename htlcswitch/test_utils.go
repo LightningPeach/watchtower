@@ -372,7 +372,7 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 
 	alicePool := lnwallet.NewSigPool(runtime.NumCPU(), aliceSigner)
 	channelAlice, err := lnwallet.NewLightningChannel(
-		aliceSigner, pCache, aliceChannelState, alicePool,
+		aliceSigner, pCache, aliceChannelState, alicePool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -381,7 +381,7 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 
 	bobPool := lnwallet.NewSigPool(runtime.NumCPU(), bobSigner)
 	channelBob, err := lnwallet.NewLightningChannel(
-		bobSigner, pCache, bobChannelState, bobPool,
+		bobSigner, pCache, bobChannelState, bobPool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -442,7 +442,7 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		}
 
 		newAliceChannel, err := lnwallet.NewLightningChannel(
-			aliceSigner, nil, aliceStoredChannel, alicePool,
+			aliceSigner, nil, aliceStoredChannel, alicePool, nil,
 		)
 		if err != nil {
 			return nil, nil, errors.Errorf("unable to create new channel: %v",
@@ -482,7 +482,7 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		}
 
 		newBobChannel, err := lnwallet.NewLightningChannel(
-			bobSigner, nil, bobStoredChannel, bobPool,
+			bobSigner, nil, bobStoredChannel, bobPool, nil,
 		)
 		if err != nil {
 			return nil, nil, errors.Errorf("unable to create new channel: %v",

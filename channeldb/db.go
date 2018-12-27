@@ -8,11 +8,14 @@ import (
 	"path/filepath"
 	"sync"
 
+	"encoding/hex"
 	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/coreos/bbolt"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"net"
 )
 
 const (
@@ -98,6 +101,13 @@ var (
 var bufPool = &sync.Pool{
 	New: func() interface{} { return new(bytes.Buffer) },
 }
+
+var (
+	watchtowerBucket   = []byte("watchtower")
+	revocationBucket   = []byte("revocation")
+	peersBucket        = []byte("peers")
+	watchChannelBucket = []byte("watchtower-channel")
+)
 
 // DB is the primary datastore for the lnd daemon. The database stores
 // information related to nodes, routing data, open/closed channels, fee
@@ -579,6 +589,332 @@ func (d *DB) FetchClosedChannels(pendingOnly bool) ([]*ChannelCloseSummary, erro
 	}
 
 	return chanSummaries, nil
+}
+
+// SaveWtChannel saves newChannel to database as one of the channels
+// requested by clientPubKey.
+func (d *DB) SaveWtChannel(newChannel *OpenChannel,
+	clientPubKey *btcec.PublicKey) error {
+
+	return d.Update(func(tx *bbolt.Tx) error {
+		wtBucket, err := tx.CreateBucketIfNotExists(watchtowerBucket)
+		if err != nil {
+			return err
+		}
+
+		watchChanBucket, err := wtBucket.CreateBucketIfNotExists(watchChannelBucket)
+		if err != nil {
+			return err
+		}
+
+		clientPubKeyBucket, err := watchChanBucket.CreateBucketIfNotExists(
+			clientPubKey.SerializeCompressed(),
+		)
+		if err != nil {
+			return err
+		}
+
+		chainHash := newChannel.ChainHash
+		// We'll then recurse down an additional layer in order to fetch the
+		// bucket for this particular chain.
+		chainBucket, err := clientPubKeyBucket.CreateBucketIfNotExists(chainHash[:])
+		if err != nil {
+			return err
+		}
+
+		// With the bucket for the node fetched, we can now go down another
+		// level, creating the bucket (if it doesn't exist), for this channel
+		// itself.
+		var chanPointBuf bytes.Buffer
+		fundingOutpoint := newChannel.FundingOutpoint
+		if err := writeOutpoint(&chanPointBuf, &fundingOutpoint); err != nil {
+			return err
+		}
+
+		chanBucket, err := chainBucket.CreateBucketIfNotExists(
+			chanPointBuf.Bytes(),
+		)
+		if err != nil {
+			return err
+		}
+		return putChanInfo(chanBucket, newChannel)
+	})
+}
+
+// FetchWtChannels attempts to fetch all channels that must be watched
+// by the watchtower from the database for current client.
+func (d *DB) FetchWtChannels(chainHash chainhash.Hash) (map[*btcec.PublicKey][]*OpenChannel, error) {
+	channelsMap := make(map[*btcec.PublicKey][]*OpenChannel)
+	err := d.View(func(tx *bbolt.Tx) error {
+		// Get the bucket dedicated to storing the metadata for open
+		// channels.
+		wtBucket := tx.Bucket(watchtowerBucket)
+		if wtBucket == nil {
+			return nil
+		}
+
+		watchChanBucket := wtBucket.Bucket(watchChannelBucket)
+		if watchChanBucket == nil {
+			return nil
+		}
+
+		// Next, we'll need to go down an additional layer in order to
+		// retrieve the revocation data for each chain the node knows of.
+		return watchChanBucket.ForEach(func(clientPubKeyBytes, v []byte) error {
+			// If there's a value, it's not a bucket so ignore it.
+			if v != nil {
+				return nil
+			}
+
+			clientPubKey, err := btcec.ParsePubKey(clientPubKeyBytes, btcec.S256())
+			if err != nil {
+				return err
+			}
+
+			// If we've found a valid clientPubKey bucket, then we'll
+			// retrieve that so we can extract all the channels.
+			clientPubKeyBucket := watchChanBucket.Bucket(clientPubKeyBytes)
+			if clientPubKeyBucket == nil {
+				return fmt.Errorf("unable to read bucket for "+
+					"clientPubKey=%x", clientPubKeyBytes[:])
+			}
+
+			chainBucket := clientPubKeyBucket.Bucket(chainHash[:])
+			if chainBucket == nil {
+				return fmt.Errorf("unable to read bucket for "+
+					"chainHash=%x", chainHash[:])
+			}
+
+			var channels []*OpenChannel
+			// A node may have channels on several chains, so for each known chain,
+			// we'll extract all the channels.
+			err = chainBucket.ForEach(func(chanPoint, v []byte) error {
+				// If there's a value, it's not a bucket so ignore it.
+				if v != nil {
+					return nil
+				}
+
+				// Once we've found a valid channel bucket, we'll extract it
+				// from the node's chain bucket.
+				chanBucket := chainBucket.Bucket(chanPoint)
+				var outPoint wire.OutPoint
+				err := readOutpoint(bytes.NewReader(chanPoint), &outPoint)
+				if err != nil {
+					return err
+				}
+
+				channel := &OpenChannel{}
+
+				// We'll read all the static information needed for watchtower
+				// server.
+				if err := fetchChanInfo(chanBucket, channel); err != nil {
+					return fmt.Errorf("unable to fetch chan info: %v", err)
+				}
+				channel.Packager = NewChannelPackager(channel.ShortChannelID)
+				channel.Db = d
+				channels = append(channels, channel)
+				return nil
+			})
+			channelsMap[clientPubKey] = channels
+			return err
+		})
+	})
+	return channelsMap, err
+}
+
+// FetchEncryptedRevocationData attempts to fetch all encrypted revocation
+// data that was previously received form other lnds.
+func (d *DB) FetchEncryptedRevocationData(clientPubKey *btcec.PublicKey,
+	chainHash chainhash.Hash,
+	fundingOutpoint wire.OutPoint) (map[uint64][]byte, error) {
+
+	revDataBytes := make(map[uint64][]byte)
+	err := d.View(func(tx *bbolt.Tx) error {
+		wtBucket := tx.Bucket(watchtowerBucket)
+		if wtBucket == nil {
+			return nil
+		}
+		revBucket := wtBucket.Bucket(revocationBucket)
+		if revBucket == nil {
+			return nil
+		}
+
+		clientPubKeyBucket := revBucket.Bucket(
+			clientPubKey.SerializeCompressed(),
+		)
+		if clientPubKeyBucket == nil {
+			return nil
+		}
+
+		chainBucket := clientPubKeyBucket.Bucket(chainHash[:])
+		if chainBucket == nil {
+			return nil
+		}
+
+		var chanPointBuf bytes.Buffer
+		if err := writeOutpoint(&chanPointBuf, &fundingOutpoint); err != nil {
+			return err
+		}
+		chanBucket := chainBucket.Bucket(chanPointBuf.Bytes())
+		if chanBucket == nil {
+			return nil
+		}
+
+		return chanBucket.ForEach(func(index, revocationDataBytes []byte) error {
+			height := binary.BigEndian.Uint64(index)
+			revDataBytes[height] = revocationDataBytes
+			return nil
+		})
+	})
+
+	return revDataBytes, err
+}
+
+// SaveEncryptedRevocation puts data required to make justice tx for the channel
+// defined by outpoint, identityPub and chainHash. Height is the state number
+// of the breach transaction, corresponding to passed revokeBase and
+// commitPoint.
+func (d *DB) SaveEncryptedRevocation(fundingOutpoint wire.OutPoint, height uint64,
+	chainHash chainhash.Hash, encryptedData []byte,
+	clientPubKey *btcec.PublicKey) error {
+
+	return d.Update(func(tx *bbolt.Tx) error {
+		wtBucket, err := tx.CreateBucketIfNotExists(watchtowerBucket)
+		if err != nil {
+			return err
+		}
+
+		revBucket, err := wtBucket.CreateBucketIfNotExists(revocationBucket)
+		if err != nil {
+			return err
+		}
+
+		clientPubKeyBucket, err := revBucket.CreateBucketIfNotExists(
+			clientPubKey.SerializeCompressed(),
+		)
+		if err != nil {
+			return err
+		}
+
+		// We'll then recurse down an additional layer in order to fetch the
+		// bucket for this particular chain.
+		chainBucket, err := clientPubKeyBucket.CreateBucketIfNotExists(chainHash[:])
+		if err != nil {
+			return err
+		}
+
+		// With the bucket for the node fetched, we can now go down another
+		// level, creating the bucket (if it doesn't exist), for this channel
+		// itself.
+		var chanPointBuf bytes.Buffer
+		if err := writeOutpoint(&chanPointBuf, &fundingOutpoint); err != nil {
+			return err
+		}
+		chanBucket, err := chainBucket.CreateBucketIfNotExists(
+			chanPointBuf.Bytes(),
+		)
+		if err != nil {
+			return err
+		}
+
+		var index [8]byte
+		binary.BigEndian.PutUint64(index[:], height)
+		return chanBucket.Put(index[:], encryptedData[:])
+	})
+}
+
+func (d *DB) SavePeer(address net.Addr, clientPubKey *btcec.PublicKey,
+	chainHash chainhash.Hash) error {
+
+	return d.Update(func(tx *bbolt.Tx) error {
+		wtBucket, err := tx.CreateBucketIfNotExists(watchtowerBucket)
+		if err != nil {
+			return err
+		}
+
+		peersBucket, err := wtBucket.CreateBucketIfNotExists(peersBucket)
+		if err != nil {
+			return err
+		}
+
+		clientPubKeyBucket, err := peersBucket.CreateBucketIfNotExists(
+			clientPubKey.SerializeCompressed(),
+		)
+		if err != nil {
+			return err
+		}
+
+		var b bytes.Buffer
+		if err := serializeAddr(&b, address); err != nil {
+			return err
+		}
+
+		return clientPubKeyBucket.Put(chainHash[:], b.Bytes())
+	})
+}
+
+func (d *DB) DeletePeer(clientPubKey *btcec.PublicKey,
+	chainHash chainhash.Hash) error {
+
+	return d.Update(func(tx *bbolt.Tx) error {
+		wtBucket, err := tx.CreateBucketIfNotExists(watchtowerBucket)
+		if err != nil {
+			return err
+		}
+
+		peersBucket, err := wtBucket.CreateBucketIfNotExists(peersBucket)
+		if err != nil {
+			return err
+		}
+
+		return peersBucket.Delete(clientPubKey.SerializeCompressed())
+	})
+}
+
+func (d *DB) FetchPeers(chainHash chainhash.Hash,
+	parseAddr func(string) (net.Addr, error)) (map[string]net.Addr, error) {
+
+	peers := make(map[string]net.Addr)
+	err := d.View(func(tx *bbolt.Tx) error {
+		wtBucket := tx.Bucket(watchtowerBucket)
+		if wtBucket == nil {
+			return nil
+		}
+		peersBucket := wtBucket.Bucket(peersBucket)
+		if peersBucket == nil {
+			return nil
+		}
+
+		return peersBucket.ForEach(func(clientPubKey, v []byte) error {
+			// If there's a value, it's not a bucket so ignore it.
+			if v != nil {
+				return nil
+			}
+
+			clientPubKeyBucket := peersBucket.Bucket(clientPubKey)
+			if clientPubKeyBucket == nil {
+				return nil
+			}
+
+			addressBytes := clientPubKeyBucket.Get(chainHash[:])
+			if addressBytes == nil {
+				return errors.New("unable to find watchtower server's address")
+			}
+
+			addressReader := bytes.NewReader(addressBytes)
+			addr, err := deserializeAddr(addressReader)
+			if err != nil {
+				return err
+			}
+
+			pubString := hex.EncodeToString(clientPubKey)
+			peers[pubString] = addr
+			return nil
+		})
+
+	})
+
+	return peers, err
 }
 
 // ErrClosedChannelNotFound signals that a closed channel could not be found in

@@ -26,6 +26,7 @@ import (
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/sweep"
+	"github.com/lightningnetwork/lnd/wtower"
 )
 
 // Loggers per subsystem.  A single backend logger is created and all subsystem
@@ -71,6 +72,7 @@ var (
 	sgnrLog = build.NewSubLogger("SGNR", backendLog.Logger)
 	wlktLog = build.NewSubLogger("WLKT", backendLog.Logger)
 	arpcLog = build.NewSubLogger("ARPC", backendLog.Logger)
+	wtwrLog = build.NewSubLogger("WTWT", backendLog.Logger)
 )
 
 // Initialize package-global logger variables.
@@ -91,6 +93,7 @@ func init() {
 	signrpc.UseLogger(sgnrLog)
 	walletrpc.UseLogger(wlktLog)
 	autopilotrpc.UseLogger(arpcLog)
+	wtower.UseLogger(wtwrLog)
 }
 
 // subsystemLoggers maps each subsystem identifier to its associated logger.
@@ -117,6 +120,7 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"SGNR": sgnrLog,
 	"WLKT": wlktLog,
 	"ARPC": arpcLog,
+	"WTWT": wtwrLog,
 }
 
 // initLogRotator initializes the logging rotator to write logs to logFile and

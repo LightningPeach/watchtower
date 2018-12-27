@@ -1447,7 +1447,7 @@ func TestStateUpdatePersistence(t *testing.T) {
 
 	aliceChannelNew, err := NewLightningChannel(
 		aliceChannel.Signer, nil, aliceChannels[0],
-		aliceChannel.sigPool,
+		aliceChannel.sigPool, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to create new channel: %v", err)
@@ -1455,7 +1455,7 @@ func TestStateUpdatePersistence(t *testing.T) {
 
 	bobChannelNew, err := NewLightningChannel(
 		bobChannel.Signer, nil, bobChannels[0],
-		bobChannel.sigPool,
+		bobChannel.sigPool, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to create new channel: %v", err)
@@ -2550,13 +2550,13 @@ func TestChanSyncFullySynced(t *testing.T) {
 	}
 
 	aliceChannelNew, err := NewLightningChannel(
-		aliceChannel.Signer, nil, aliceChannels[0], aliceChannel.sigPool,
+		aliceChannel.Signer, nil, aliceChannels[0], aliceChannel.sigPool, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to create new channel: %v", err)
 	}
 	bobChannelNew, err := NewLightningChannel(
-		bobChannel.Signer, nil, bobChannels[0], bobChannel.sigPool,
+		bobChannel.Signer, nil, bobChannels[0], bobChannel.sigPool, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to create new channel: %v", err)
@@ -2579,7 +2579,7 @@ func restartChannel(channelOld *LightningChannel) (*LightningChannel, error) {
 
 	channelNew, err := NewLightningChannel(
 		channelOld.Signer, channelOld.pCache, nodeChannels[0],
-		channelOld.sigPool,
+		channelOld.sigPool, nil,
 	)
 	if err != nil {
 		return nil, err
@@ -5584,7 +5584,7 @@ func TestChannelRestoreUpdateLogs(t *testing.T) {
 	// the update logs up to the correct state set up above.
 	newAliceChannel, err := NewLightningChannel(
 		aliceChannel.Signer, nil, aliceChannel.channelState,
-		aliceChannel.sigPool,
+		aliceChannel.sigPool, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to create new channel: %v", err)
@@ -5592,7 +5592,7 @@ func TestChannelRestoreUpdateLogs(t *testing.T) {
 
 	newBobChannel, err := NewLightningChannel(
 		bobChannel.Signer, nil, bobChannel.channelState,
-		bobChannel.sigPool,
+		bobChannel.sigPool, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to create new channel: %v", err)
@@ -5666,7 +5666,7 @@ func restoreAndAssert(t *testing.T, channel *LightningChannel, numAddsLocal,
 
 	newChannel, err := NewLightningChannel(
 		channel.Signer, nil, channel.channelState,
-		channel.sigPool,
+		channel.sigPool, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to create new channel: %v", err)
@@ -5976,7 +5976,7 @@ func TestChannelRestoreCommitHeight(t *testing.T) {
 
 		newChannel, err := NewLightningChannel(
 			channel.Signer, nil, channel.channelState,
-			channel.sigPool,
+			channel.sigPool, nil,
 		)
 		if err != nil {
 			t.Fatalf("unable to create new channel: %v", err)

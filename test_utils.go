@@ -23,6 +23,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
 	"github.com/lightningnetwork/lnd/ticker"
+	"github.com/lightningnetwork/lnd/wtower"
 )
 
 var (
@@ -300,7 +301,7 @@ func createTestPeer(notifier chainntnfs.ChainNotifier,
 
 	alicePool := lnwallet.NewSigPool(1, aliceSigner)
 	channelAlice, err := lnwallet.NewLightningChannel(
-		aliceSigner, nil, aliceChannelState, alicePool,
+		aliceSigner, nil, aliceChannelState, alicePool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -309,7 +310,7 @@ func createTestPeer(notifier chainntnfs.ChainNotifier,
 
 	bobPool := lnwallet.NewSigPool(1, bobSigner)
 	channelBob, err := lnwallet.NewLightningChannel(
-		bobSigner, nil, bobChannelState, bobPool,
+		bobSigner, nil, bobChannelState, bobPool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -334,10 +335,13 @@ func createTestPeer(notifier chainntnfs.ChainNotifier,
 
 	breachArbiter := &breachArbiter{}
 
+	wtServer := wtower.NewServer(nil, make([]net.Addr, 1, 1))
+
 	chainArb := contractcourt.NewChainArbitrator(
 		contractcourt.ChainArbitratorConfig{
 			Notifier: notifier,
 			ChainIO:  chainIO,
+			WTServer: wtServer,
 		}, dbAlice,
 	)
 	chainArb.WatchNewChannel(aliceChannelState)

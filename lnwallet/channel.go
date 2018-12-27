@@ -15,11 +15,16 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
 
+	"encoding/binary"
+	"encoding/json"
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcutil/txsort"
+	"golang.org/x/crypto/chacha20poly1305"
+	"io"
+	"reflect"
 )
 
 var zeroHash chainhash.Hash
@@ -337,6 +342,439 @@ type PaymentDescriptor struct {
 	// isForwarded denotes if an incoming HTLC has been forwarded to any
 	// possible upstream peers in the route.
 	isForwarded bool
+}
+
+// IndividualSigsAndFees contains data that will be used to generate separete
+// punish transaction for first and second level HTLC.
+type IndividualSigsAndFees struct {
+	// RegularSig contains signature to spend first level revocation.
+	RegularSig []byte
+	// RegularFee contains fee for first level revocation.
+	RegularFee int64
+
+	// SecondLevelSig contains signature to spend second level revocation.
+	SecondLevelSig []byte
+	// SecondLevelFee contains fee for second level revocation.
+	SecondLevelFee int64
+}
+
+// TxInInfo contain all the information needed to punish revocation
+// output (or second level htlc) either as one transaction for
+// all htlcs, or as several transactions -- one for each htlc.
+type TxInInfo struct {
+	// Sig contains signature for output with WitnessType, defined by
+	// PreviousOutpointIndex and has htlc timeout of RefundTimeout.
+	Sig []byte
+	// RHash contains htlc rhash that is used to generate htlc script.
+	RHash                 [32]byte
+	WitnessType           WitnessType
+	PreviousOutpointIndex uint32
+	RefundTimeout         uint32
+	// If this output is already spent (for example, counterparty sent it
+	// to the second level), we must revoke every output separately.
+	// IndividualSigsAndFees contains signatures required to spend regular
+	// outputs and second level outputs individually. This approach will only
+	// be used if we fail to spend all outputs in one transaction.
+	IndividualSigsAndFees *IndividualSigsAndFees
+}
+
+const (
+	NonceSize = chacha20poly1305.NonceSize
+)
+
+// TODO(ys): RevocationData to another file
+// RevocationData is struct sent to watchtower server that will be used to
+// generate justice transaction(s) upon breach detection.
+type RevocationData struct {
+	// CommitPoint is used by watchtower server to generate different keys
+	// that will be used to reproduce witness scripts.
+	CommitPoint *btcec.PublicKey
+
+	// TxInInfo is array that contains information about every output of
+	// revocation transaction, that will be used as input of individual
+	// 1-to-1 justice transactions.
+	TxInInfo []*TxInInfo
+
+	// PkScript contains output address for justice transaction.
+	PkScript []byte
+
+	// Fee contains fee required to send while justice transaction.
+	Fee int64
+
+	// CommitmentHash contains hash of remote's node commitment transaction.
+	CommitmentHash chainhash.Hash
+}
+
+func (rd *RevocationData) Encode(w io.Writer, pver uint32) error {
+	rd.CommitPoint.Curve = nil
+	b, err := json.Marshal(rd)
+	if err != nil {
+		return err
+	}
+	msgLen := uint16(len(b))
+
+	var bLen [2]byte
+	binary.BigEndian.PutUint16(bLen[:], msgLen)
+	if _, err := w.Write(bLen[:]); err != nil {
+		return err
+	}
+
+	w.Write(b[:])
+	return nil
+}
+
+func (rd *RevocationData) Decode(r io.Reader, pver uint32) error {
+	var bLen [2]byte
+	if _, err := io.ReadFull(r, bLen[:]); err != nil {
+		return err
+	}
+	msgLen := binary.BigEndian.Uint16(bLen[:])
+
+	b := make([]byte, msgLen)
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return err
+	}
+	return json.Unmarshal(b[:], rd)
+}
+
+func (rd *RevocationData) Encrypt(pver uint32) ([]byte, error) {
+	// Encode the plaintext using the provided version, to obtain the
+	// plaintext bytes.
+	var ptxtBuf bytes.Buffer
+	err := rd.Encode(&ptxtBuf, pver)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new chacha20poly1305 cipher, using a 32-byte key.
+	cipher, err := chacha20poly1305.New(rd.CommitmentHash[:])
+	if err != nil {
+		return nil, err
+	}
+
+	// Allocate the ciphertext, which will contain the encrypted plaintext
+	// and MAC.
+	plaintext := ptxtBuf.Bytes()
+	// Finally, encrypt the plaintext using 0 nonce.
+	nonce := make([]byte, NonceSize)
+	ciphertext := cipher.Seal(nil, nonce, plaintext, nil)
+
+	return ciphertext, nil
+}
+
+func (rd *RevocationData) Decrypt(key, ciphertext []byte, pver uint32) error {
+	// TODO(ys): verify input size
+
+	// Create a new chacha20poly1305 cipher, using a 32-byte key.
+	cipher, err := chacha20poly1305.New(key)
+	if err != nil {
+		return err
+	}
+
+	// Decrypt the ciphertext, using 0 nonce.
+	nonce := make([]byte, NonceSize)
+	plaintext, err := cipher.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return err
+	}
+
+	// If decryption succeeded, we will then decode the plaintext bytes
+	// using the specified blob version.
+	err = rd.Decode(bytes.NewReader(plaintext), pver)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// revDataUpdateTxInInfo adds TxInInfo array to rev data, which contains
+// all of the information excluding IndividualSigsAndFees.
+func (lc *LightningChannel) revDataUpdateTxInInfo(
+	height uint64, revData *RevocationData, justiceTx *wire.MsgTx) error {
+
+	revokedSnapshot, err := lc.channelState.FindPreviousState(height)
+	if err != nil {
+		return err
+	}
+
+	htlcs := &revokedSnapshot.Htlcs
+
+	for i, txin := range justiceTx.TxIn {
+		revData.TxInInfo[i].Sig = txin.Witness[0]
+		revData.TxInInfo[i].PreviousOutpointIndex =
+			txin.PreviousOutPoint.Index
+	}
+	// Offset is increased with every non-htlc input, i.e. "CommitmentNoDelay"
+	// or "CommitmentRevoke". CommitmentNoDelay, if present, should be the
+	// first. CommitmentRevoke, if present, should be on the next position.
+	offset := 0
+	if len(justiceTx.TxIn[0].Witness) == 2 {
+		revData.TxInInfo[0].WitnessType = CommitmentNoDelay
+		offset++
+	}
+	// If true, it means not all non-htlc inputs have been added, and since
+	// CommitmentNoDelay has already been checked, we now add CommitmentRevoke.
+	if offset < len(justiceTx.TxIn)-len(*htlcs) {
+		revData.TxInInfo[offset].WitnessType = CommitmentRevoke
+		offset++
+	}
+
+	if len(revData.TxInInfo) != offset + len(*htlcs) {
+		return fmt.Errorf("number of inputs for revocation data (%d) does " +
+			"not match the number of htlcs (%d)", len(revData.TxInInfo),
+			offset + len(*htlcs))
+	}
+
+	for i, htlc := range *htlcs {
+		copy(revData.TxInInfo[i+offset].RHash[:], htlc.RHash[:])
+		if htlc.Incoming {
+			revData.TxInInfo[i+offset].WitnessType = HtlcAcceptedRevoke
+		} else {
+			revData.TxInInfo[i+offset].WitnessType = HtlcOfferedRevoke
+		}
+		revData.TxInInfo[i+offset].RefundTimeout = htlc.RefundTimeout
+	}
+	return nil
+}
+
+func (lc *LightningChannel) getSecondLevelSigFee(pkScript []byte,
+	keyRing *CommitmentKeyRing, commitSecret *btcec.PrivateKey,
+	amount int64, txHash chainhash.Hash) ([]byte, int64, error) {
+
+	var weightEstimate TxWeightEstimator
+	weightEstimate.AddP2WKHOutput()
+	weightEstimate.AddWitnessInput(ToLocalPenaltyWitnessSize)
+	feePerKw := SatPerKWeight(lc.channelState.LocalCommitment.FeePerKw)
+	totalFee := feePerKw.FeeForWeight(int64(weightEstimate.Weight()))
+
+	// With the fee calculated, we can now create the transaction using the
+	// information gathered above and the provided retribution information.
+	txn := wire.NewMsgTx(2)
+
+	// We begin by adding the output to which our funds will be deposited.
+	txn.AddTxOut(&wire.TxOut{
+		PkScript: pkScript,
+		Value:    amount - int64(totalFee),
+	})
+
+	txn.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: *wire.NewOutPoint(&txHash, 0),
+	})
+
+	// Before signing the transaction, check to ensure that it meets some
+	// basic validity requirements.
+	btx := btcutil.NewTx(txn)
+	if err := blockchain.CheckTransactionSanity(btx); err != nil {
+		return []byte{}, 0, fmt.Errorf("counterparty's second level tx: %+v", err)
+	}
+
+	wScript, _ := secondLevelHtlcScript(
+		keyRing.RevocationKey, keyRing.DelayKey,
+		uint32(lc.remoteChanCfg.CsvDelay),
+	)
+
+	signDesc := &SignDescriptor{
+		KeyDesc:       lc.channelState.LocalChanCfg.RevocationBasePoint,
+		WitnessScript: wScript,
+		Output: &wire.TxOut{
+			Value: amount,
+		},
+		InputIndex:  0,
+		HashType:    txscript.SigHashAll,
+		SigHashes:   txscript.NewTxSigHashes(txn),
+		DoubleTweak: commitSecret,
+	}
+
+	txWitness, err := htlcSpendRevoke(lc.Signer, signDesc, txn)
+	return txWitness[0], int64(totalFee), err
+}
+
+// RevDataLatestHeight return the latest state number for which revocation
+// data can be generated.
+func (lc *LightningChannel) RevDataLatestHeight() uint64 {
+	return lc.currentHeight - 1
+}
+
+// GenerateRevDataLatest generate revocation data for the latest channel state
+// possible.
+func (lc *LightningChannel) GenerateRevDataLatest() (
+	*RevocationData, uint64, error) {
+
+	height := lc.RevDataLatestHeight()
+	revData, err := lc.GenerateRevDataAtHeight(height)
+	return revData, height, err
+}
+
+// GetRevDataOnInterval return a map that have state number as index and
+// revocation data as value for each state number from the interval
+// from startHeight to endHeight inclusive.
+func (lc *LightningChannel) GetRevDataOnInterval(startHeight uint64,
+	endHeight uint64) map[uint64]*RevocationData {
+
+	revDataMap := make(map[uint64]*RevocationData)
+
+	latestHeight := lc.RevDataLatestHeight()
+	if endHeight > latestHeight {
+		endHeight = latestHeight
+	}
+
+	for height := startHeight; height <= endHeight; height++ {
+		if revData, err := lc.GenerateRevDataAtHeight(height); err == nil {
+			revDataMap[height] = revData
+		}
+	}
+	return revDataMap
+}
+
+// GenerateRevDataAtHeight generates RevocationData that will be sent to
+// watchtower server and which will be used to crate one or several (in case
+// at least one of the commitment outputs has already been spend by the time
+// watchtower publishes punishment) justice transactions for state number
+// equals to height.
+func (lc *LightningChannel) GenerateRevDataAtHeight(height uint64) (
+	*RevocationData, error) {
+
+	if lc.wtServer == nil || reflect.ValueOf(lc.wtServer).IsNil() {
+		return nil, fmt.Errorf("unable to create revData: wtServer is nil")
+	}
+
+	revData := &RevocationData{}
+	retribution, err := NewBreachRetributionAtHeight(lc.channelState, height)
+	if err != nil {
+		return nil, err
+	}
+
+	justiceTxChan := make(chan *wire.MsgTx, 1)
+	var individualSigsAndFees []*IndividualSigsAndFees
+	breachInfoReq := &BreachInfoReq{
+		OutPoint:              lc.channelState.FundingOutpoint,
+		Retribution:           retribution,
+		JusticeTx:             justiceTxChan,
+		IndividualSigsAndFees: individualSigsAndFees,
+	}
+	lc.wtServer.ProcessBreachInfoReq(breachInfoReq)
+	// Program will wait until breach arbiter generates all the required data.
+	justiceTx := <-breachInfoReq.JusticeTx
+	if justiceTx == nil {
+		return nil, fmt.Errorf("received justiceTx is nil")
+	}
+	revData.PkScript = justiceTx.TxOut[0].PkScript
+	// In order to calculate fee, we first calculate the total amount for
+	// breach transaction, then subtract justice output amount from it.
+	var breachAmount int64 = 0
+	remoteCommit, err := lc.channelState.FindPreviousState(height)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, txOut := range remoteCommit.CommitTx.TxOut {
+		breachAmount += txOut.Value
+	}
+	revData.Fee = breachAmount - justiceTx.TxOut[0].Value
+
+	// Copy generated sigs and fees for first level breach.
+	for _, sigsAndFees := range breachInfoReq.IndividualSigsAndFees {
+		revData.TxInInfo = append(revData.TxInInfo, &TxInInfo{
+			IndividualSigsAndFees: sigsAndFees,
+		})
+	}
+
+	if len(justiceTx.TxIn) != len(revData.TxInInfo) {
+		return nil, fmt.Errorf("different number of inputs for justice tx " +
+			"(%d) and revocation data (%d)", len(justiceTx.TxIn),
+			len(revData.TxInInfo))
+	}
+
+	amounts := breachInfoReq.Amounts
+
+	err = lc.revDataUpdateTxInInfo(height, revData, justiceTx)
+	if err != nil {
+		return nil, err
+	}
+
+	// We can now derive/restore the proper revocation preimage necessary
+	// to sweep the remote party's output at current height.
+	revocationPreimage, err := lc.channelState.RevocationStore.LookUp(height)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO(ys): send revocationPreimage instead and store it on server using
+	// efficient per-commitment secret storage.
+	commitSecret, commitPoint := btcec.PrivKeyFromBytes(
+		btcec.S256(), revocationPreimage[:],
+	)
+	revData.CommitPoint = commitPoint
+
+	keyRing := deriveCommitmentKeys(commitPoint, false, lc.localChanCfg,
+		lc.remoteChanCfg)
+
+	// Now we will add SecondLevelSig and SecondLevelFee for all outputs that
+	// can be sent to the second level.
+	for i, txInInfo := range revData.TxInInfo {
+		var (
+			tx     *wire.MsgTx
+			amount btcutil.Amount
+		)
+		switch txInInfo.WitnessType {
+		// HtlcAcceptedRevoke can be spent by other party with HtlcTimeoutTx.
+		// In order to revoke this second level transaction we have to generate
+		// if first.
+		case HtlcAcceptedRevoke:
+			// With the fee calculated, re-construct the second level timeout
+			// transaction.
+			htlcFee := htlcTimeoutFee(SatPerKWeight(remoteCommit.FeePerKw))
+			amount = amounts[i] - htlcFee
+			tx, err = createHtlcTimeoutTx(
+				justiceTx.TxIn[i].PreviousOutPoint, amount,
+				txInInfo.RefundTimeout, uint32(lc.remoteChanCfg.CsvDelay),
+				keyRing.RevocationKey, keyRing.DelayKey,
+			)
+			if err != nil {
+				walletLog.Warnf("Error creating counterparty's "+
+					"timeoutTx: %+v", err)
+				continue
+			}
+
+		// HtlcOfferedRevoke can be spent by other party with HtlcSuccessTx.
+		// In order to revoke this second level transaction we have to generate
+		// if first.
+		case HtlcOfferedRevoke:
+			htlcFee := htlcSuccessFee(SatPerKWeight(remoteCommit.FeePerKw))
+			amount = amounts[i] - htlcFee
+			tx, err = createHtlcSuccessTx(
+				justiceTx.TxIn[i].PreviousOutPoint, amount,
+				uint32(lc.remoteChanCfg.CsvDelay),
+				keyRing.RevocationKey, keyRing.DelayKey,
+			)
+			if err != nil {
+				walletLog.Warnf("Error creating counterparty's "+
+					"successTx: %+v", err)
+				continue
+			}
+
+		// We are interested only in HTLC's that can be sent to the second
+		// level, so we simply ignore everything else.
+		default:
+			continue
+		}
+
+		// Now that we have counterparty's second level transaction, we can
+		// make a revocation and extract required data for watchtower.
+		secLevelSig, secLevelFee, err := lc.getSecondLevelSigFee(
+			revData.PkScript, keyRing, commitSecret,
+			int64(amount), tx.TxHash(),
+		)
+		if err != nil {
+			walletLog.Warnf("Error constructing second level sig "+
+				"and fee: %+v", err)
+		}
+		revData.TxInInfo[i].IndividualSigsAndFees.SecondLevelSig = secLevelSig
+		revData.TxInInfo[i].IndividualSigsAndFees.SecondLevelFee = secLevelFee
+	}
+	revData.CommitmentHash = breachInfoReq.Retribution.BreachTransaction.TxHash()
+	return revData, nil
 }
 
 // PayDescsFromRemoteLogUpdates converts a slice of LogUpdates received from the
@@ -1342,7 +1780,16 @@ type LightningChannel struct {
 	// channel.
 	RemoteFundingKey *btcec.PublicKey
 
+	wtServer WTServer
+
 	sync.RWMutex
+}
+
+type WTServer interface {
+	// ProcessBreachInfoReq passes breachInfoReq to breachArbiter, generates
+	// revocation data and justiceTx there and then passes this data back.
+	ProcessBreachInfoReq(*BreachInfoReq)
+	SendNewAddRevocationData(uint64, wire.OutPoint, *RevocationData) error
 }
 
 // NewLightningChannel creates a new, active payment channel given an
@@ -1351,8 +1798,8 @@ type LightningChannel struct {
 // automatically persist pertinent state to the database in an efficient
 // manner.
 func NewLightningChannel(signer Signer, pCache PreimageCache,
-	state *channeldb.OpenChannel,
-	sigPool *SigPool) (*LightningChannel, error) {
+	state *channeldb.OpenChannel, sigPool *SigPool,
+	wtServer WTServer) (*LightningChannel, error) {
 
 	localCommit := state.LocalCommitment
 	remoteCommit := state.RemoteCommitment
@@ -1382,6 +1829,7 @@ func NewLightningChannel(signer Signer, pCache PreimageCache,
 		Capacity:          state.Capacity,
 		LocalFundingKey:   state.LocalChanCfg.MultiSigKey.PubKey,
 		RemoteFundingKey:  state.RemoteChanCfg.MultiSigKey.PubKey,
+		wtServer:          wtServer,
 	}
 
 	// With the main channel struct reconstructed, we'll now restore the
@@ -1893,6 +2341,33 @@ type BreachRetribution struct {
 	HtlcRetributions []HtlcRetribution
 }
 
+// BreachInfoReq is a struct that is used in channel by watchtower client to
+// establish communication between breach arbiter and lnwallet.
+type BreachInfoReq struct {
+	OutPoint wire.OutPoint
+
+	Retribution *BreachRetribution
+
+	// JusticeTx is used to pass justice transaction generated by breach arbiter.
+	JusticeTx chan *wire.MsgTx
+
+	// IndividualSigsAndFees contains
+	IndividualSigsAndFees []*IndividualSigsAndFees
+
+	Amounts []btcutil.Amount
+}
+
+func NewBreachRetributionAtHeight(chanState *channeldb.OpenChannel,
+	stateNum uint64) (*BreachRetribution, error) {
+
+	revokedSnapshot, err := chanState.FindPreviousState(stateNum)
+	if err != nil {
+		return nil, err
+	}
+	broadcastCommitment := revokedSnapshot.CommitTx
+	return NewBreachRetribution(chanState, stateNum, broadcastCommitment, 0)
+}
+
 // NewBreachRetribution creates a new fully populated BreachRetribution for the
 // passed channel, at a particular revoked state number, and one which targets
 // the passed commitment transaction.
@@ -2047,7 +2522,7 @@ func NewBreachRetribution(chanState *channeldb.OpenChannel, stateNum uint64,
 			}
 
 		} else {
-			// Otherwise, is this was an outgoing HTLC that we
+			// Otherwise, if this was an outgoing HTLC that we
 			// sent, then from the PoV of the remote commitment
 			// state, they're the receiver of this HTLC.
 			htlcWitnessScript, err = receiverHTLCScript(
@@ -2399,7 +2874,7 @@ func (lc *LightningChannel) createCommitmentTx(c *commitment,
 		return err
 	}
 
-	// Finally, we'll assert that were not attempting to draw more out of
+	// Finally, we'll assert that we're not attempting to draw more out of
 	// the channel that was originally placed within it.
 	var totalOut btcutil.Amount
 	for _, txOut := range commitTx.TxOut {
@@ -2464,7 +2939,7 @@ func (lc *LightningChannel) evaluateHTLCView(view *htlcView, ourBalance,
 
 		// We check if the parent entry is not found at this point. We
 		// have seen this happening a few times and panic with some
-		// addtitional info to figure out why.
+		// additional info to figure out why.
 		// TODO(halseth): remove when bug is fixed.
 		if addEntry == nil {
 			panic(fmt.Sprintf("unable to find parent entry %d "+
@@ -2671,7 +3146,7 @@ func genRemoteHtlcSigJobs(keyRing *CommitmentKeyRing,
 		sigJob.Cancel = cancelChan
 		sigJob.Resp = make(chan SignJobResp, 1)
 
-		// As this is an incoming HTLC and we're sinning the commitment
+		// As this is an incoming HTLC and we're signing the commitment
 		// transaction of the remote node, we'll need to generate an
 		// HTLC timeout transaction for them. The output of the timeout
 		// transaction needs to account for fees, so we'll compute the
@@ -3919,6 +4394,31 @@ func (i *InvalidHtlcSigError) Error() string {
 // error interface.
 var _ error = (*InvalidCommitSigError)(nil)
 
+// SendRevocationToWt gathers all the data required for constructing justice
+// transaction for the latest commitment transaction and sends it to remote
+// watchtower. After watchtower detects breach on-chain, it uses that data
+// to construct and publish corresponding justice transaction.
+func (lc *LightningChannel) SendRevocationToWt() error {
+	revocationData, height, err := lc.GenerateRevDataLatest()
+	if err != nil {
+		return err
+	}
+	if height < 0 {
+		return nil
+	}
+
+	// Now that the all required data is ready, it can be sent to the
+	// watchtower server.
+	err = lc.wtServer.SendNewAddRevocationData(
+		height, lc.channelState.FundingOutpoint, revocationData,
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // ReceiveNewCommitment process a signature for a new commitment state sent by
 // the remote party. This method should be called in response to the
 // remote party initiating a new change, or when the remote party sends a
@@ -3932,6 +4432,10 @@ func (lc *LightningChannel) ReceiveNewCommitment(commitSig lnwire.Sig,
 
 	lc.Lock()
 	defer lc.Unlock()
+
+	if err := lc.SendRevocationToWt(); err != nil {
+		walletLog.Warnf("SendRevocationToWTt: %v", err)
+	}
 
 	// Determine the last update on the local log that has been locked in.
 	localACKedIndex := lc.remoteCommitChain.tail().ourMessageIndex
@@ -5180,7 +5684,7 @@ type OutgoingHtlcResolution struct {
 // goes broadcasts a commitment transaction with live HTLC's.
 type HtlcResolutions struct {
 	// IncomingHTLCs contains a set of structs that can be used to sweep
-	// all the incoming HTL'C that we know the preimage to.
+	// all the incoming HTLC's that we know the preimage to.
 	IncomingHTLCs []IncomingHtlcResolution
 
 	// OutgoingHTLCs contains a set of structs that contains all the info
@@ -5532,8 +6036,8 @@ func extractHtlcResolutions(feePerKw SatPerKWeight, ourCommit bool,
 
 // LocalForceCloseSummary describes the final commitment state before the
 // channel is locked-down to initiate a force closure by broadcasting the
-// latest state on-chain. If we intend to broadcast this this state, the
-// channel should not be used after generating this close summary.  The summary
+// latest state on-chain. If we intend to broadcast this state, the
+// channel should not be used after generating this close summary. The summary
 // includes all the information required to claim all rightfully owned outputs
 // when the commitment gets confirmed.
 type LocalForceCloseSummary struct {

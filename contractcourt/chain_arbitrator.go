@@ -8,6 +8,7 @@ import (
 
 	"github.com/lightningnetwork/lnd/sweep"
 
+	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
@@ -15,6 +16,8 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/wtower"
+	"sort"
 )
 
 // ErrChainArbExiting signals that the chain arbitrator is shutting down.
@@ -134,7 +137,14 @@ type ChainArbitratorConfig struct {
 	DisableChannel func(wire.OutPoint) error
 
 	// Sweeper allows resolvers to sweep their final outputs.
-	Sweeper *sweep.UtxoSweeper
+	Sweeper       *sweep.UtxoSweeper
+	BreachInfoReq chan lnwallet.BreachInfoReq
+
+	JusticeTx chan *wire.MsgTx
+	// BreachInfoReqChan is a channel that receives data that is used
+	// to create a justice transaction
+	BreachInfoReqChan chan lnwallet.BreachInfoReq
+	WTServer          *wtower.WTServer
 }
 
 // ChainArbitrator is a sub-system that oversees the on-chain resolution of all
@@ -160,6 +170,10 @@ type ChainArbitrator struct {
 	// that are still considered open.
 	activeWatchers map[wire.OutPoint]*chainWatcher
 
+	// activeWtWatchers is a map of all active chainWatchers for each
+	// watchtower client for channels that are still considered open.
+	activeWtWatchers map[wtower.PubKey]map[wire.OutPoint]*chainWatcher
+
 	// cfg is the config struct for the arbitrator that contains all
 	// methods and interface it needs to operate.
 	cfg ChainArbitratorConfig
@@ -179,18 +193,20 @@ func NewChainArbitrator(cfg ChainArbitratorConfig,
 	db *channeldb.DB) *ChainArbitrator {
 
 	return &ChainArbitrator{
-		cfg:            cfg,
-		activeChannels: make(map[wire.OutPoint]*ChannelArbitrator),
-		activeWatchers: make(map[wire.OutPoint]*chainWatcher),
-		chanSource:     db,
-		quit:           make(chan struct{}),
+		cfg:              cfg,
+		activeChannels:   make(map[wire.OutPoint]*ChannelArbitrator),
+		activeWatchers:   make(map[wire.OutPoint]*chainWatcher),
+		activeWtWatchers: make(map[wtower.PubKey]map[wire.OutPoint]*chainWatcher),
+		chanSource:       db,
+		quit:             make(chan struct{}),
 	}
 }
 
 // newActiveChannelArbitrator creates a new instance of an active channel
 // arbitrator given the state of the target channel.
 func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
-	c *ChainArbitrator, chanEvents *ChainEventSubscription) (*ChannelArbitrator, error) {
+	c *ChainArbitrator, chanEvents *ChainEventSubscription,
+	wtServer *wtower.WTServer) (*ChannelArbitrator, error) {
 
 	log.Tracef("Creating ChannelArbitrator for ChannelPoint(%v)",
 		channel.FundingOutpoint)
@@ -239,7 +255,7 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 			}
 
 			chanMachine, err := lnwallet.NewLightningChannel(
-				c.cfg.Signer, c.cfg.PreimageDB, channel, nil,
+				c.cfg.Signer, c.cfg.PreimageDB, channel, nil, wtServer,
 			)
 			if err != nil {
 				return nil, err
@@ -322,6 +338,27 @@ func (c *ChainArbitrator) resolveContract(chanPoint wire.OutPoint,
 	return nil
 }
 
+func (c *ChainArbitrator) SaveEncryptedRevocation(height uint64,
+	fundingOutpoint wire.OutPoint, encryptedData []byte,
+	clientPubKey *btcec.PublicKey) error {
+
+	var pubKey wtower.PubKey
+	pubKey.FromPublicKey(clientPubKey)
+	if chainWatcher, ok := c.activeWtWatchers[pubKey][fundingOutpoint]; ok {
+		err := chainWatcher.AppendRevocationData(
+			height, encryptedData, clientPubKey,
+		)
+		if err != nil {
+			return err
+		}
+	} else {
+		log.Errorf("WT: channel watcher for ChannelPoint(%v) "+
+			"and client %x not found.", fundingOutpoint,
+			clientPubKey.SerializeCompressed())
+	}
+	return nil
+}
+
 // Start launches all goroutines that the ChainArbitrator needs to operate.
 func (c *ChainArbitrator) Start() error {
 	if !atomic.CompareAndSwapInt32(&c.started, 0, 1) {
@@ -342,8 +379,59 @@ func (c *ChainArbitrator) Start() error {
 			len(openChannels))
 	}
 
-	// For each open channel, we'll configure then launch a corresponding
-	// ChannelArbitrator.
+	var watchersArray []*chainWatcher
+	// If this node is a watchtower server, there may be several
+	// channels already saved to database.
+	wtChannels, err := c.chanSource.FetchWtChannels(c.cfg.ChainHash)
+	if err != nil {
+		return err
+	}
+	if len(wtChannels) > 0 {
+		log.Infof("Found %d watchtower channels.", len(wtChannels))
+	}
+	for clientPubKey, clientChannels := range wtChannels {
+		var pubKey wtower.PubKey
+		pubKey.FromPublicKey(clientPubKey)
+		c.activeWtWatchers[pubKey] = make(map[wire.OutPoint]*chainWatcher)
+		for _, channel := range clientChannels {
+			chanPoint := channel.FundingOutpoint
+			// First, we'll create an active chainWatcher for this channel
+			// to ensure that we detect any relevant on chain events.
+			chainWatcher, err := newChainWatcher(
+				chainWatcherConfig{
+					chanState: channel,
+					notifier:  c.cfg.Notifier,
+					pCache:    c.cfg.PreimageDB,
+					signer:    c.cfg.Signer,
+					isOurAddr: c.cfg.IsOurAddress,
+					contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
+						return c.cfg.ContractBreach(chanPoint, retInfo)
+					},
+					publishTx: c.cfg.PublishTx,
+					db:        c.chanSource,
+				},
+			)
+			if err != nil {
+				return err
+			}
+			c.activeWtWatchers[pubKey][chanPoint] = chainWatcher
+			// After chain watcher is created we should fetch all the relevant
+			// revocation data saved to database for its clientPubKey.
+			encryptedDataMap, err := chainWatcher.cfg.db.FetchEncryptedRevocationData(
+				clientPubKey, c.cfg.ChainHash, chanPoint)
+			if err != nil {
+				return err
+			}
+			log.Infof("Found %d channel state(s) for ChannelPoint(%v) and "+
+				"client %x.", len(encryptedDataMap), chanPoint,
+				clientPubKey.SerializeCompressed())
+			chainWatcher.Lock()
+			chainWatcher.encryptedData = encryptedDataMap
+			chainWatcher.Unlock()
+			watchersArray = append(watchersArray, chainWatcher)
+		}
+	}
+
 	for _, channel := range openChannels {
 		chanPoint := channel.FundingOutpoint
 		channel := channel
@@ -360,6 +448,8 @@ func (c *ChainArbitrator) Start() error {
 				contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
 					return c.cfg.ContractBreach(chanPoint, retInfo)
 				},
+				publishTx: c.cfg.PublishTx,
+				db:        c.chanSource,
 			},
 		)
 		if err != nil {
@@ -367,8 +457,10 @@ func (c *ChainArbitrator) Start() error {
 		}
 
 		c.activeWatchers[chanPoint] = chainWatcher
+		watchersArray = append(watchersArray, chainWatcher)
 		channelArb, err := newActiveChannelArbitrator(
 			channel, c, chainWatcher.SubscribeChannelEvents(),
+			c.cfg.WTServer,
 		)
 		if err != nil {
 			return err
@@ -441,7 +533,7 @@ func (c *ChainArbitrator) Start() error {
 	// lingering goroutines are cleaned up before exiting.
 	watcherErrs := make(chan error, len(c.activeWatchers))
 	var wg sync.WaitGroup
-	for _, watcher := range c.activeWatchers {
+	for _, watcher := range watchersArray {
 		wg.Add(1)
 		go func(w *chainWatcher) {
 			defer wg.Done()
@@ -650,6 +742,56 @@ func (c *ChainArbitrator) ForceCloseContract(chanPoint wire.OutPoint) (*wire.Msg
 	return closeTx, nil
 }
 
+// NewWtChainWatcher creates and starts new chain watcher if none currently
+// exist for specified channel point and pubkey, and returns sorted array of
+// heights of saved channel states.
+func (c *ChainArbitrator) NewWtChainWatcher(newChan *channeldb.OpenChannel,
+	clientPubKey *btcec.PublicKey) ([]uint64, error) {
+
+	var (
+		pubKey wtower.PubKey
+		err    error
+		states []uint64
+	)
+	pubKey.FromPublicKey(clientPubKey)
+	chanPoint := newChan.FundingOutpoint
+	watcher, ok := c.activeWtWatchers[pubKey][chanPoint]
+	if !ok {
+		watcher, err = newChainWatcher(
+			chainWatcherConfig{
+				chanState: newChan,
+				notifier:  c.cfg.Notifier,
+				pCache:    c.cfg.PreimageDB,
+				signer:    c.cfg.Signer,
+				isOurAddr: c.cfg.IsOurAddress,
+				contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
+					return c.cfg.ContractBreach(chanPoint, retInfo)
+				},
+				publishTx: c.cfg.PublishTx,
+				db:        c.chanSource,
+			},
+		)
+		if err != nil {
+			return states, err
+		}
+		if c.activeWtWatchers[pubKey] == nil {
+			c.activeWtWatchers[pubKey] = make(map[wire.OutPoint]*chainWatcher)
+		}
+		c.activeWtWatchers[pubKey][chanPoint] = watcher
+		err = watcher.Start()
+		return states, err
+	}
+	// If the watcher already existed, we will retrieve saved heights.
+	watcher.Lock()
+	states = make([]uint64, 0, len(watcher.encryptedData))
+	for state := range watcher.encryptedData {
+		states = append(states, state)
+	}
+	watcher.Unlock()
+	sort.Slice(states, func(i, j int) bool { return states[i] < states[j] })
+	return states, nil
+}
+
 // WatchNewChannel sends the ChainArbitrator a message to create a
 // ChannelArbitrator tasked with watching over a new channel. Once a new
 // channel has finished its final funding flow, it should be registered with
@@ -680,6 +822,8 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 			contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
 				return c.cfg.ContractBreach(chanPoint, retInfo)
 			},
+			publishTx: c.cfg.PublishTx,
+			db:        c.chanSource,
 		},
 	)
 	if err != nil {
@@ -692,6 +836,7 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 	// channel, and our internal state.
 	channelArb, err := newActiveChannelArbitrator(
 		newChan, c, chainWatcher.SubscribeChannelEvents(),
+		c.cfg.WTServer,
 	)
 	if err != nil {
 		return err
@@ -705,6 +850,12 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 		return err
 	}
 
+	if c.cfg.WTServer.IsClient() {
+		err = c.cfg.WTServer.SendNewWatchNewChannel(newChan)
+		if err != nil {
+			log.Errorf("WatchNewChannel WT err: %v", err)
+		}
+	}
 	return chainWatcher.Start()
 }
 

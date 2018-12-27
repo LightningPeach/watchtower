@@ -190,10 +190,12 @@ type config struct {
 	RawRPCListeners  []string `long:"rpclisten" description:"Add an interface/port/socket to listen for RPC connections"`
 	RawRESTListeners []string `long:"restlisten" description:"Add an interface/port/socket to listen for REST connections"`
 	RawListeners     []string `long:"listen" description:"Add an interface/port to listen for peer connections"`
+	RawWtListeners   []string `long:"wtlisten" description:"Add an interface/port to listen for watchtower peer connections"`
 	RawExternalIPs   []string `long:"externalip" description:"Add an ip:port to the list of local addresses we claim to listen on to peers. If a port is not specified, the default (9735) will be used regardless of other parameters"`
 	RPCListeners     []net.Addr
 	RESTListeners    []net.Addr
 	Listeners        []net.Addr
+	WtListeners      []net.Addr
 	ExternalIPs      []net.Addr
 	DisableListen    bool          `long:"nolisten" description:"Disable listening for incoming peer connections"`
 	NAT              bool          `long:"nat" description:"Toggle NAT traversal support (using either UPnP or NAT-PMP) to automatically advertise your external IP address to the network -- NOTE this does not support devices behind multiple NATs"`
@@ -909,6 +911,7 @@ func loadConfig() (*config, error) {
 	if cfg.DisableListen {
 		ltndLog.Infof("Listening on the p2p interface is disabled!")
 		cfg.Listeners = nil
+		cfg.WtListeners = nil
 		cfg.ExternalIPs = nil
 	} else {
 
@@ -916,6 +919,16 @@ func loadConfig() (*config, error) {
 		// duplicate addresses.
 		cfg.Listeners, err = lncfg.NormalizeAddresses(
 			cfg.RawListeners, strconv.Itoa(defaultPeerPort),
+			cfg.net.ResolveTCPAddr,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// Add default port to all external IP addresses if needed and remove
+		// duplicate addresses.
+		cfg.WtListeners, err = lncfg.NormalizeAddresses(
+			cfg.RawWtListeners, strconv.Itoa(defaultPeerPort),
 			cfg.net.ResolveTCPAddr,
 		)
 		if err != nil {
@@ -943,12 +956,29 @@ func loadConfig() (*config, error) {
 				return nil, err
 			}
 		}
+		for _, p2pListener := range cfg.WtListeners {
+			if lncfg.IsUnix(p2pListener) {
+				err := fmt.Errorf("unix socket addresses cannot be "+
+					"used for the p2p connection listener: %s",
+					p2pListener)
+				return nil, err
+			}
+		}
 	}
 
 	// Ensure that we are only listening on localhost if Tor inbound support
 	// is enabled.
 	if cfg.Tor.V2 || cfg.Tor.V3 {
 		for _, addr := range cfg.Listeners {
+			if lncfg.IsLoopback(addr.String()) {
+				continue
+			}
+
+			return nil, errors.New("lnd must *only* be listening " +
+				"on localhost when running with Tor inbound " +
+				"support enabled")
+		}
+		for _, addr := range cfg.WtListeners {
 			if lncfg.IsLoopback(addr.String()) {
 				continue
 			}

@@ -1112,6 +1112,89 @@
           "Lightning"
         ]
       }
+    },
+    "/v1/watchtowers": {
+      "get": {
+        "summary": "* lncli: `listwatchtowers`\nListWatchtowers returns a verbose listing of all connected watchtowers\nactive and inactive.",
+        "operationId": "ListWatchtowers",
+        "responses": {
+          "200": {
+            "description": "",
+            "schema": {
+              "$ref": "#/definitions/lnrpcListWatchtowersResponse"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "active_only",
+            "in": "query",
+            "required": false,
+            "type": "boolean",
+            "format": "boolean"
+          },
+          {
+            "name": "inactive_only",
+            "in": "query",
+            "required": false,
+            "type": "boolean",
+            "format": "boolean"
+          }
+        ],
+        "tags": [
+          "Lightning"
+        ]
+      },
+      "post": {
+        "summary": "* lncli: `addwatchtower`\nAddWatchtower allows the caller to connect to a remote lnd watchtower.",
+        "operationId": "AddWatchtower",
+        "responses": {
+          "200": {
+            "description": "",
+            "schema": {
+              "$ref": "#/definitions/lnrpcAddWatchtowerResponse"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/lnrpcAddWatchtowerRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Lightning"
+        ]
+      }
+    },
+    "/v1/watchtowers/{pub_key}": {
+      "delete": {
+        "summary": "* lncli: `disconnect`\nDisconnectWatchtower allows the caller to close connection to specified\nremote watchtower and removes related info from the database.",
+        "operationId": "DisconnectWatchtower",
+        "responses": {
+          "200": {
+            "description": "",
+            "schema": {
+              "$ref": "#/definitions/lnrpcDisconnectWatchtowerResponse"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "pub_key",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Lightning"
+        ]
+      }
     }
   },
   "definitions": {
@@ -1265,6 +1348,18 @@
           "description": "*\nThe \"add\" index of this invoice. Each newly created invoice will increment\nthis index making it monotonically increasing. Callers to the\nSubscribeInvoices call can use this to instantly get notified of all added\ninvoices with an add_index greater than this one."
         }
       }
+    },
+    "lnrpcAddWatchtowerRequest": {
+      "type": "object",
+      "properties": {
+        "addr": {
+          "$ref": "#/definitions/lnrpcLightningAddress",
+          "title": "/ Lightning address of the peer, in the format `\u003cpubkey\u003e@host`"
+        }
+      }
+    },
+    "lnrpcAddWatchtowerResponse": {
+      "type": "object"
     },
     "lnrpcAddressType": {
       "type": "string",
@@ -1685,6 +1780,9 @@
       "type": "object"
     },
     "lnrpcDisconnectPeerResponse": {
+      "type": "object"
+    },
+    "lnrpcDisconnectWatchtowerResponse": {
       "type": "object"
     },
     "lnrpcFeeLimit": {
@@ -2253,6 +2351,18 @@
             "$ref": "#/definitions/lnrpcUtxo"
           },
           "title": "/ A list of utxos"
+        }
+      }
+    },
+    "lnrpcListWatchtowersResponse": {
+      "type": "object",
+      "properties": {
+        "watchtowers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/lnrpcWatchtower"
+          },
+          "title": "/ The list of active channels"
         }
       }
     },
@@ -2863,6 +2973,21 @@
         }
       }
     },
+    "lnrpcSendRevDataToWtResponse": {
+      "type": "object",
+      "properties": {
+        "successfully_sent": {
+          "type": "string",
+          "format": "uint64",
+          "description": "/ The total number of state numbers for which revocation data could be successfully generated/retrieved and sent."
+        },
+        "failed_to_send": {
+          "type": "string",
+          "format": "uint64",
+          "description": "/ The total number of state numbers for which revocation data could not be successfully generated/retrieved and sent."
+        }
+      }
+    },
     "lnrpcSendToRouteRequest": {
       "type": "object",
       "properties": {
@@ -3057,6 +3182,28 @@
           "type": "string",
           "format": "int64",
           "title": "/ The unconfirmed balance of a wallet(with 0 confirmations)"
+        }
+      }
+    },
+    "lnrpcWatchtower": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean",
+          "format": "boolean",
+          "title": "/ Whether this watchtower is active or not"
+        },
+        "pub_key": {
+          "type": "string",
+          "title": "/ The identity pubkey of the watchtower"
+        },
+        "address": {
+          "type": "string"
+        },
+        "ping_time": {
+          "type": "string",
+          "format": "int64",
+          "title": "/ Ping time to this peer"
         }
       }
     }

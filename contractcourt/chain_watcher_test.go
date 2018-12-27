@@ -74,6 +74,7 @@ func TestChainWatcherRemoteUnilateralClose(t *testing.T) {
 		chanState: aliceChannel.State(),
 		notifier:  aliceNotifier,
 		signer:    aliceChannel.Signer,
+		db:        aliceChannel.State().Db,
 	})
 	if err != nil {
 		t.Fatalf("unable to create chain watcher: %v", err)
@@ -138,6 +139,7 @@ func TestChainWatcherRemoteUnilateralClosePendingCommit(t *testing.T) {
 		chanState: aliceChannel.State(),
 		notifier:  aliceNotifier,
 		signer:    aliceChannel.Signer,
+		db:        aliceChannel.State().Db,
 	})
 	if err != nil {
 		t.Fatalf("unable to create chain watcher: %v", err)

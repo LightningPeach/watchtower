@@ -291,6 +291,10 @@ func main() {
 		feeReportCommand,
 		updateChannelPolicyCommand,
 		forwardingHistoryCommand,
+		sendRevDataToWtCommand,
+		addWatchtowerCommand,
+		listWatchtowersCommand,
+		disconnectWatchtowerCommand,
 	}
 
 	// Add any extra autopilot commands determined by build flags.

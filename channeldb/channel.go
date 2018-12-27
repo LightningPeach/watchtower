@@ -877,7 +877,7 @@ func (c *OpenChannel) SyncPending(addr net.Addr, pendingHeight uint32) error {
 
 // UpdateCommitment updates the commitment state for the specified party
 // (remote or local). The commitment stat completely describes the balance
-// state at this point in the commitment chain. This method its to be called on
+// state at this point in the commitment chain. This method is to be called on
 // two occasions: when we revoke our prior commitment state, and when the
 // remote party revokes their prior commitment state.
 func (c *OpenChannel) UpdateCommitment(newCommitment *ChannelCommitment) error {

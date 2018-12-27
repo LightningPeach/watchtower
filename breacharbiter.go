@@ -21,6 +21,7 @@ import (
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/sweep"
+	"github.com/lightningnetwork/lnd/wtower"
 )
 
 var (
@@ -106,6 +107,8 @@ type BreachConfig struct {
 	// breached channels. This is used in conjunction with DB to recover
 	// from crashes, restarts, or other failures.
 	Store RetributionStore
+
+	WTServer *wtower.WTServer
 }
 
 // breachArbiter is a special subsystem which is responsible for watching and
@@ -256,6 +259,12 @@ func (b *breachArbiter) contractObserver() {
 
 	brarLog.Infof("Starting contract observer, watching for breaches.")
 
+	var breachInfoReqChan <-chan *lnwallet.BreachInfoReq
+	if b.cfg.WTServer != nil {
+		breachInfoReqChan = b.cfg.WTServer.GetBreachInfoReqChan()
+	} else {
+		breachInfoReqChan = make(<-chan *lnwallet.BreachInfoReq, 1)
+	}
 	for {
 		select {
 		case breachEvent := <-b.cfg.ContractBreaches:
@@ -265,6 +274,38 @@ func (b *breachArbiter) contractObserver() {
 			// store.
 			b.wg.Add(1)
 			go b.handleBreachHandoff(breachEvent)
+
+		case breachInfoReq := <-breachInfoReqChan:
+			// We received a new request to create justice transaction for
+			// passed OutPoint. We will do so and insert the justice
+			// transaction and individual signatures into breachInfoReq, so
+			// the caller can use them.
+			retInfo := newRetributionInfo(
+				&breachInfoReq.OutPoint, breachInfoReq.Retribution,
+			)
+			justiceTx, err := b.createJusticeTx(retInfo)
+			if err != nil {
+				brarLog.Errorf("BreachInfoReqChan: error creating "+
+					"justiceTx: %v", err)
+			}
+
+			if justiceTx != nil {
+				individualSigsAndFees, amounts, err := b.getIndividualSigsAndFees(
+					retInfo, justiceTx.TxOut[0].PkScript,
+				)
+				if err != nil {
+					brarLog.Errorf("BreachInfoReqChan: error creating "+
+						"individualSigsAndFees: %v", err)
+				}
+				breachInfoReq.IndividualSigsAndFees = append(
+					breachInfoReq.IndividualSigsAndFees, individualSigsAndFees...)
+				breachInfoReq.Amounts = amounts
+			}
+			// Pushing justiceTx to this channels signals that breach arbiter
+			// has finished its work.
+			//
+			// TODO(ys): add additional channel instead?
+			breachInfoReq.JusticeTx <- justiceTx
 
 		case <-b.quit:
 			return
@@ -487,7 +528,7 @@ func (b *breachArbiter) exactRetribution(confChan *chainntnfs.ConfirmationEvent,
 
 	// We may have to wait for some of the HTLC outputs to be spent to the
 	// second level before broadcasting the justice tx. We'll store the
-	// SpendEvents between each attempt to not re-register uneccessarily.
+	// SpendEvents between each attempt to not re-register unnecessarily.
 	spendNtfns := make(map[wire.OutPoint]*chainntnfs.SpendEvent)
 
 	finalTx, err := b.cfg.Store.GetFinalizedTxn(&breachInfo.chanPoint)
@@ -808,7 +849,7 @@ func (bo *breachedOutput) SignDesc() *lnwallet.SignDescriptor {
 }
 
 // BuildWitness computes a valid witness that allows us to spend from the
-// breached output. It does so by first generating and memoizing the witness
+// breached output. It does so by first generating and memorizing the witness
 // generation function, which parameterized primarily by the witness type and
 // sign descriptor. The method then returns the witness computed by invoking
 // this function on the first and subsequent calls.
@@ -945,6 +986,81 @@ func newRetributionInfo(chanPoint *wire.OutPoint,
 	}
 }
 
+// getIndividualSigsAndFees takes passed retributionInfo, then separately
+// passes every breached output to sweepSpendableOutputsTxs to generate
+// signatures and fees for regular spend (i.e. data that will be required
+// by watchtower to spend outputs that were not sent to second level).
+func (b *breachArbiter) getIndividualSigsAndFees(r *retributionInfo,
+	pkScript []byte) ([]*lnwallet.IndividualSigsAndFees, []btcutil.Amount, error) {
+
+	var (
+		// amounts saves input amount for all breached outputs. If counterparty
+		// sent transaction to the second level, these amounts will be used to
+		// create corresponding second level transaction and to build
+		// revocations on top of these transactions.
+		amounts               []btcutil.Amount
+		individualSigsAndFees []*lnwallet.IndividualSigsAndFees
+	)
+
+	for i := range r.breachedOutputs {
+		// The justice transaction we construct will be a segwit transaction
+		// that pays to a p2wkh output. Components such as the version,
+		// nLockTime, and output are already included in the TxWeightEstimator.
+		var (
+			weightEstimate lnwallet.TxWeightEstimator
+		)
+		weightEstimate.AddP2WKHOutput()
+
+		// Grab locally scoped reference to breached output.
+		input := &r.breachedOutputs[i]
+
+		// Next, select the appropriate estimated witness weight for
+		// the give witness type of this breached output. If the witness
+		// type is unrecognized, we will omit it from the transaction.
+		var witnessWeight int
+		switch input.WitnessType() {
+		case lnwallet.CommitmentNoDelay:
+			witnessWeight = lnwallet.P2WKHWitnessSize
+
+		case lnwallet.CommitmentRevoke:
+			witnessWeight = lnwallet.ToLocalPenaltyWitnessSize
+
+		case lnwallet.HtlcOfferedRevoke:
+			witnessWeight = lnwallet.OfferedHtlcPenaltyWitnessSize
+
+		case lnwallet.HtlcAcceptedRevoke:
+			witnessWeight = lnwallet.AcceptedHtlcPenaltyWitnessSize
+
+		// This case should not happen for transaction that breach commitment.
+		case lnwallet.HtlcSecondLevelRevoke:
+			witnessWeight = lnwallet.ToLocalPenaltyWitnessSize
+
+		default:
+			brarLog.Warnf("breached output in retribution info "+
+				"contains unexpected witness type: %v",
+				input.WitnessType())
+			continue
+		}
+
+		weightEstimate.AddWitnessInput(witnessWeight)
+		txWeight := int64(weightEstimate.Weight())
+		msgTx, err := b.sweepSpendableOutputsTxn(txWeight, pkScript, input)
+		if err != nil {
+			brarLog.Warnf("Error sweeping HTLC: %v", err)
+			continue
+		}
+
+		sigsAndFees := &lnwallet.IndividualSigsAndFees{
+			RegularSig: msgTx.TxIn[0].Witness[0],
+			RegularFee: int64(input.amt) - msgTx.TxOut[0].Value,
+		}
+		amounts = append(amounts, input.amt)
+		individualSigsAndFees = append(individualSigsAndFees, sigsAndFees)
+	}
+
+	return individualSigsAndFees, amounts, nil
+}
+
 // createJusticeTx creates a transaction which exacts "justice" by sweeping ALL
 // the funds within the channel which we are now entitled to due to a breach of
 // the channel's contract by the counterparty. This function returns a *fully*
@@ -978,7 +1094,7 @@ func (b *breachArbiter) createJusticeTx(
 		input := &r.breachedOutputs[i]
 
 		// First, select the appropriate estimated witness weight for
-		// the give witness type of this breached output. If the witness
+		// the given witness type of this breached output. If the witness
 		// type is unrecognized, we will omit it from the transaction.
 		var witnessWeight int
 		switch input.WitnessType() {
@@ -1010,14 +1126,6 @@ func (b *breachArbiter) createJusticeTx(
 	}
 
 	txWeight := int64(weightEstimate.Weight())
-	return b.sweepSpendableOutputsTxn(txWeight, spendableOutputs...)
-}
-
-// sweepSpendableOutputsTxn creates a signed transaction from a sequence of
-// spendable outputs by sweeping the funds into a single p2wkh output.
-func (b *breachArbiter) sweepSpendableOutputsTxn(txWeight int64,
-	inputs ...sweep.Input) (*wire.MsgTx, error) {
-
 	// First, we obtain a new public key script from the wallet which we'll
 	// sweep the funds to.
 	// TODO(roasbeef): possibly create many outputs to minimize change in
@@ -1026,6 +1134,13 @@ func (b *breachArbiter) sweepSpendableOutputsTxn(txWeight int64,
 	if err != nil {
 		return nil, err
 	}
+	return b.sweepSpendableOutputsTxn(txWeight, pkScript, spendableOutputs...)
+}
+
+// sweepSpendableOutputsTxn creates a signed transaction from a sequence of
+// spendable outputs by sweeping the funds into a single p2wkh output.
+func (b *breachArbiter) sweepSpendableOutputsTxn(txWeight int64,
+	pkScript []byte, inputs ...sweep.Input) (*wire.MsgTx, error) {
 
 	// Compute the total amount contained in the inputs.
 	var totalAmt btcutil.Amount

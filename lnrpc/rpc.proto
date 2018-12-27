@@ -668,6 +668,42 @@ service Lightning {
             body: "*"
         };
     };
+
+    /** lncli: `sendrevdatatowt`
+    SendRevDataToWt allows the caller to send any of the previous revocation
+    data to watchtower.
+    */
+    rpc SendRevDataToWt(SendRevDataToWtRequest) returns (SendRevDataToWtResponse);
+
+    /** lncli: `addwatchtower`
+    AddWatchtower allows the caller to connect to a remote lnd watchtower.
+    */
+    rpc AddWatchtower (AddWatchtowerRequest) returns (AddWatchtowerResponse) {
+        option (google.api.http) = {
+            post: "/v1/watchtowers"
+            body: "*"
+        };
+    }
+
+    /** lncli: `listwatchtowers`
+    ListWatchtowers returns a verbose listing of all connected watchtowers
+    active and inactive.
+    */
+    rpc ListWatchtowers (ListWatchtowersRequest) returns (ListWatchtowersResponse) {
+        option (google.api.http) = {
+            get: "/v1/watchtowers"
+        };
+    }
+
+    /** lncli: `disconnect`
+    DisconnectWatchtower allows the caller to close connection to specified
+    remote watchtower and removes related info from the database.
+    */
+    rpc DisconnectWatchtower (DisconnectWatchtowerRequest) returns (DisconnectWatchtowerResponse) {
+        option (google.api.http) = {
+            delete: "/v1/watchtowers/{pub_key}"
+        };
+    }
 }
 
 message Utxo {
@@ -2034,4 +2070,59 @@ message ForwardingHistoryResponse {
 
    /// The index of the last time in the set of returned forwarding events. Can be used to seek further, pagination style.
    uint32 last_offset_index = 2 [json_name = "last_offset_index"];
+}
+
+message SendRevDataToWtRequest {
+    /// The channel for which the revocation data will be sent.
+    ChannelPoint channel_point = 1 [json_name = "channel_point"];
+
+    /// start_height is the first state number for which revocation data will be sent.
+    uint64 start_height = 2 [json_name = "start_height"];
+
+    /// end_height is the last state number for which revocation data will be sent.
+    uint64 end_height = 3 [json_name = "end_height"];
+}
+
+message SendRevDataToWtResponse {
+    /// The total number of state numbers for which revocation data could be successfully generated/retrieved and sent.
+    uint64 successfully_sent = 1 [json_name = "successfully_sent"];
+
+    /// The total number of state numbers for which revocation data could not be successfully generated/retrieved and sent.
+    uint64 failed_to_send = 2 [json_name = "failed_to_send"];
+}
+
+message AddWatchtowerRequest {
+    /// Lightning address of the peer, in the format `<pubkey>@host`
+    LightningAddress addr = 1;
+}
+message AddWatchtowerResponse {
+}
+
+message ListWatchtowersRequest {
+    bool active_only = 1;
+    bool inactive_only = 2;
+}
+message ListWatchtowersResponse {
+    /// The list of active channels
+    repeated Watchtower watchtowers = 1 [json_name = "watchtowers"];
+}
+message Watchtower {
+    /// Whether this watchtower is active or not
+    bool active = 1 [json_name = "active"];
+
+    /// The identity pubkey of the watchtower
+    string pub_key = 2 [json_name = "pub_key"];
+
+    string address = 3 [json_name = "address"];
+
+    /// Ping time to this peer
+    int64 ping_time = 4 [json_name = "ping_time"];
+
+    // TODO(ys): add time connected and bytes sent/received
+}
+message DisconnectWatchtowerRequest {
+    /// The pubkey of the watchtower to disconnect from
+    string pub_key = 1 [json_name = "pub_key"];
+}
+message DisconnectWatchtowerResponse {
 }

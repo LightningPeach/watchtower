@@ -1557,7 +1557,7 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 
 	alicePool := lnwallet.NewSigPool(1, aliceSigner)
 	channelAlice, err := lnwallet.NewLightningChannel(
-		aliceSigner, pCache, aliceChannelState, alicePool,
+		aliceSigner, pCache, aliceChannelState, alicePool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1566,7 +1566,7 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 
 	bobPool := lnwallet.NewSigPool(1, bobSigner)
 	channelBob, err := lnwallet.NewLightningChannel(
-		bobSigner, pCache, bobChannelState, bobPool,
+		bobSigner, pCache, bobChannelState, bobPool, nil,
 	)
 	if err != nil {
 		return nil, nil, nil, err

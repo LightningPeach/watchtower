@@ -162,6 +162,12 @@ func Ripemd160H(d []byte) []byte {
 	return h.Sum(nil)
 }
 
+func SenderHTLCScript(senderHtlcKey, receiverHtlcKey,
+	revocationKey *btcec.PublicKey, paymentHash []byte) ([]byte, error) {
+
+	return senderHTLCScript(senderHtlcKey, receiverHtlcKey, revocationKey, paymentHash)
+}
+
 // senderHTLCScript constructs the public key script for an outgoing HTLC
 // output payment for the sender's version of the commitment transaction. The
 // possible script paths from this output include:
@@ -276,7 +282,7 @@ func senderHTLCScript(senderHtlcKey, receiverHtlcKey,
 // HTLC to claim the output with knowledge of the revocation private key in the
 // scenario that the sender of the HTLC broadcasts a previously revoked
 // commitment transaction. A valid spend requires knowledge of the private key
-// that corresponds to their revocation base point and also the private key fro
+// that corresponds to their revocation base point and also the private key for
 // the per commitment point, and a valid signature under the combined public
 // key.
 func senderHtlcSpendRevoke(signer Signer, signDesc *SignDescriptor,
@@ -373,6 +379,14 @@ func senderHtlcSpendTimeout(receiverSig []byte, signer Signer,
 	witnessStack[4] = signDesc.WitnessScript
 
 	return witnessStack, nil
+}
+
+func ReceiverHTLCScript(cltvExpiry uint32, senderHtlcKey,
+	receiverHtlcKey, revocationKey *btcec.PublicKey,
+	paymentHash []byte) ([]byte, error) {
+
+	return receiverHTLCScript(cltvExpiry, senderHtlcKey,
+		receiverHtlcKey, revocationKey, paymentHash)
 }
 
 // receiverHTLCScript constructs the public key script for an incoming HTLC
@@ -724,6 +738,12 @@ func createHtlcSuccessTx(htlcOutput wire.OutPoint, htlcAmt btcutil.Amount,
 	return successTx, nil
 }
 
+func SecondLevelHtlcScript(revocationKey, delayKey *btcec.PublicKey,
+	csvDelay uint32) ([]byte, error) {
+
+	return secondLevelHtlcScript(revocationKey, delayKey, csvDelay)
+}
+
 // secondLevelHtlcScript is the uniform script that's used as the output for
 // the second-level HTLC transactions. The second level transaction act as a
 // sort of covenant, ensuring that a 2-of-2 multi-sig output can only be
@@ -760,7 +780,7 @@ func secondLevelHtlcScript(revocationKey, delayKey *btcec.PublicKey,
 	// if statement.
 	builder.AddOp(txscript.OP_IF)
 
-	// If this this is the revocation case, then we'll push the revocation
+	// If this is the revocation case, then we'll push the revocation
 	// public key on the stack.
 	builder.AddData(revocationKey.SerializeCompressed())
 

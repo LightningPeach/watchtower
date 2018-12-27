@@ -667,7 +667,7 @@ func (c *ChannelArbitrator) stateStep(triggerHeight uint32,
 		}
 
 		// Now that we know we'll need to act, we'll process the htlc
-		// actions, wen create the structures we need to resolve all
+		// actions, then create the structures we need to resolve all
 		// outstanding contracts.
 		htlcResolvers, pktsToSend, err := c.prepContractResolutions(
 			chainActions, contractResolutions, triggerHeight,
@@ -1045,7 +1045,7 @@ func (c *ChannelArbitrator) checkChainActions(height uint32,
 	return actionMap
 }
 
-// prepContractResolutions is called either int he case that we decide we need
+// prepContractResolutions is called either in the case that we decide we need
 // to go to chain, or the remote party goes to chain. Given a set of actions we
 // need to take for each HTLC, this method will return a set of contract
 // resolvers that will resolve the contracts on-chain if needed, and also a set

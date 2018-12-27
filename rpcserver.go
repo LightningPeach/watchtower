@@ -97,6 +97,10 @@ var (
 			Entity: "invoices",
 			Action: "read",
 		},
+		{
+			Entity: "watchtower",
+			Action: "read",
+		},
 	}
 
 	// writePermissions is a slice of all entities that allow write
@@ -133,6 +137,10 @@ var (
 		{
 			Entity: "signer",
 			Action: "generate",
+		},
+		{
+			Entity: "watchtower",
+			Action: "write",
 		},
 	}
 
@@ -340,6 +348,22 @@ var (
 		"/lnrpc.Lightning/ForwardingHistory": {{
 			Entity: "offchain",
 			Action: "read",
+		}},
+		"/lnrpc.Lightning/SendRevDataToWt": {{
+			Entity: "watchtower",
+			Action: "write",
+		}},
+		"/lnrpc.Lightning/AddWatchtower": {{
+			Entity: "watchtower",
+			Action: "write",
+		}},
+		"/lnrpc.Lightning/ListWatchtowers": {{
+			Entity: "watchtower",
+			Action: "read",
+		}},
+		"/lnrpc.Lightning/DisconnectWatchtower": {{
+			Entity: "watchtower",
+			Action: "write",
 		}},
 	}
 )
@@ -1679,7 +1703,7 @@ func (r *rpcServer) fetchActiveChannel(chanPoint wire.OutPoint) (
 	// we create a fully populated channel state machine which
 	// uses the db channel as backing storage.
 	return lnwallet.NewLightningChannel(
-		r.server.cc.wallet.Cfg.Signer, nil, dbChan, nil,
+		r.server.cc.wallet.Cfg.Signer, nil, dbChan, nil, r.server.wtServer,
 	)
 }
 
@@ -4707,4 +4731,176 @@ func (r *rpcServer) ForwardingHistory(ctx context.Context,
 	}
 
 	return resp, nil
+}
+
+// SendRevDataToWt generates revocation data for all state numbers on the
+// interval from StartHeight to EndHeight inclusive, and then send
+// this data to watchtower server. If no StartHeight of EndHeight is specified,
+// the default value of 0 or maximum available state number will be used
+// instead respectively.
+// Number of successful and unsuccessful send returned.
+func (r *rpcServer) SendRevDataToWt(ctx context.Context,
+	in *lnrpc.SendRevDataToWtRequest) (*lnrpc.SendRevDataToWtResponse, error) {
+
+	index := in.ChannelPoint.OutputIndex
+	txidHash, err := getChanPointFundingTxid(in.GetChannelPoint())
+	if err != nil {
+		rpcsLog.Errorf("[sendrevdatatowt] unable to get funding txid: %v", err)
+		return nil, err
+	}
+	txid, err := chainhash.NewHash(txidHash)
+	if err != nil {
+		rpcsLog.Errorf("[sendrevdatatowt] invalid txid: %v", err)
+		return nil, err
+	}
+	chanPoint := wire.NewOutPoint(txid, index)
+	rpcsLog.Tracef("[sendrevdatatowt] request for ChannelPoint(%v)", chanPoint)
+
+	channelID := lnwire.NewChanIDFromOutPoint(chanPoint)
+	channel, err := r.server.fundingMgr.cfg.FindChannel(channelID)
+	if err != nil {
+		return nil, err
+	}
+	err = r.server.wtServer.SendNewWatchNewChannel(channel)
+	if err != nil {
+		// Since it is possible that this channel is already being watched
+		// by watchtower, we will still try to send our revocation data
+		rpcsLog.Errorf("Error in SendNewWatchNewChannel: %v", err)
+	}
+	resp := &lnrpc.SendRevDataToWtResponse{}
+	lightningChannel, err := lnwallet.NewLightningChannel(
+		r.server.cc.signer, r.server.witnessBeacon, channel, nil,
+		r.server.wtServer,
+	)
+	if err != nil {
+		return nil, err
+	}
+	revDataMap := lightningChannel.GetRevDataOnInterval(
+		in.StartHeight, in.EndHeight,
+	)
+	for height, revData := range revDataMap {
+		err = r.server.wtServer.SendNewAddRevocationData(
+			height, *chanPoint, revData,
+		)
+		if err == nil {
+			resp.SuccessfullySent++
+		} else {
+			resp.FailedToSend++
+		}
+	}
+	return resp, nil
+}
+
+// ConnectWatchtower attempts to establish a connection to a watchtower server.
+func (r *rpcServer) AddWatchtower(ctx context.Context,
+	in *lnrpc.AddWatchtowerRequest) (*lnrpc.AddWatchtowerResponse, error) {
+
+	// The server hasn't yet started, so it won't be able to service any of
+	// our requests, so we'll bail early here.
+	if !r.server.Started() {
+		return nil, fmt.Errorf("chain backend is still syncing, server " +
+			"not active yet")
+	}
+
+	if in.Addr == nil {
+		return nil, fmt.Errorf("need: lnc pubkeyhash@hostname")
+	}
+
+	pubkeyHex, err := hex.DecodeString(in.Addr.Pubkey)
+	if err != nil {
+		return nil, err
+	}
+	pubKey, err := btcec.ParsePubKey(pubkeyHex, btcec.S256())
+	if err != nil {
+		return nil, err
+	}
+
+	// Connections to ourselves are disallowed for obvious reasons.
+	if pubKey.IsEqual(r.server.identityPriv.PubKey()) {
+		return nil, fmt.Errorf("cannot make connection to self")
+	}
+
+	addr, err := parseAddr(in.Addr.Host)
+	if err != nil {
+		return nil, err
+	}
+
+	watchtowerAddr := &lnwire.NetAddress{
+		IdentityKey: pubKey,
+		Address:     addr,
+		ChainNet:    activeNetParams.Net,
+	}
+
+	if err := r.server.wtServer.AddWatchtower(watchtowerAddr); err != nil {
+		rpcsLog.Errorf("(addwatchtower): error connecting to "+
+			"watchtower: %v", err)
+		return nil, err
+	}
+
+	rpcsLog.Debugf("Add watchtower: %v", watchtowerAddr.String())
+	return &lnrpc.AddWatchtowerResponse{}, nil
+}
+
+// ListWatchtowers returns a verbose listing of all serving watchtowers
+// (possible inactive).
+func (r *rpcServer) ListWatchtowers(ctx context.Context,
+	in *lnrpc.ListWatchtowersRequest) (*lnrpc.ListWatchtowersResponse, error) {
+
+	if in.ActiveOnly && in.InactiveOnly {
+		return nil, fmt.Errorf("either `active_only` or " +
+			"`inactive_only` can be set, but not both")
+	}
+	active, inactive := in.ActiveOnly, in.InactiveOnly
+	// If no additional parameter has been specified, we will get the info
+	// for all active and inactive watchtowers.
+	if !active && !inactive {
+		active, inactive = true, true
+	}
+
+	wtPeers := r.server.wtServer.Peers(active, inactive)
+	resp := &lnrpc.ListWatchtowersResponse{
+		Watchtowers: make([]*lnrpc.Watchtower, 0, len(wtPeers)),
+	}
+
+	for _, wtPeer := range wtPeers {
+		watchtower := &lnrpc.Watchtower{
+			Active:   wtPeer.IsActive(),
+			Address:  wtPeer.RemoteAddr(),
+			PubKey:   wtPeer.PubString(),
+			PingTime: wtPeer.PingTime(),
+		}
+		resp.Watchtowers = append(resp.Watchtowers, watchtower)
+	}
+
+	return resp, nil
+}
+
+// DisconnectWatchtower closes the connection to specified remote watchtower
+// and removes related info from the database.
+func (r *rpcServer) DisconnectWatchtower(ctx context.Context,
+	in *lnrpc.DisconnectWatchtowerRequest) (*lnrpc.DisconnectWatchtowerResponse, error) {
+
+	if !r.server.Started() {
+		return nil, fmt.Errorf("chain backend is still syncing, server " +
+			"not active yet")
+	}
+
+	// First we'll validate the string passed in within the request to
+	// ensure that it's a valid hex-string, and also a valid compressed
+	// public key.
+	pubKeyBytes, err := hex.DecodeString(in.PubKey)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode pubkey bytes: %v", err)
+	}
+	pubKey, err := btcec.ParsePubKey(pubKeyBytes, btcec.S256())
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse pubkey: %v", err)
+	}
+
+	// We'll now request that the server disconnect from the peer.
+	if err := r.server.wtServer.DisconnectWatchtower(pubKey); err != nil {
+		return nil, fmt.Errorf("unable to disconnect peer: %v", err)
+	}
+
+	return &lnrpc.DisconnectWatchtowerResponse{}, nil
 }
